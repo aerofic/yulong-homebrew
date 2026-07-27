@@ -2,7 +2,7 @@
   "id": "yulong-homebrew",
   "title": "Yulong Homebrew",
   "description": "A small collection of PF2e homebrew and compatibility tweaks: provides a troop single-target damage cap, adds GM-reviewed area weakness multiplier cards for qualifying troop area damage, forwards PF2e Toolbelt Target Helper damage/healing applications to PF2e Holodeck analytics, improves Automatic Achievements attribution for PF2e damage, healing, kills, GM rolls, and item use, supports patreon-v3 low-HP incapacitation handling, adds a hideable Fumble Switch floating widget, and quantizes PF2e HUD health colors to status bands.",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "compatibility": {
     "minimum": "14",
     "verified": "14"

@@ -1,6 +1,8 @@
 import {
     hasHolodeckKillMarker,
+    holodeckStatsHaveValues,
     isHpDefeatTransition,
+    selectHolodeckIdentityToken,
     setHolodeckKillMarker,
     summarizeHolodeckDamageRolls
 } from "./statistics.js";
@@ -24,6 +26,9 @@ const TROOP_AREA_EMANATION_RADIUS_DIVISOR = 1.4;
 const TROOP_AREA_LINE_WIDTH_FEET = 5;
 const AWA_MODULE_ID = "achievements-with-automation";
 const AWA_PF2E_PENDING_SOURCE_TIMEOUT_MS = 5000;
+// The pf2e context types Achievements With Automation's own checkThrowPF already reacts to.
+// Anything outside this set (spell attack rolls, perception checks) is ours to cover.
+const AWA_NATIVE_PF2E_THROW_TYPES = new Set(["attack-roll", "saving-throw", "skill-check"]);
 
 function isAchievementsWithAutomationActive() {
     return game.modules.get(AWA_MODULE_ID)?.active;
@@ -99,24 +104,40 @@ function recordPendingAwaPF2eDamageSourceContext({ sourceActor, targetActor, tar
     };
 }
 
+// Achievement progress lives in an actor flag. `api.grantAchievement` can hop to the GM over a
+// socket, but a raw setFlag cannot, so skip the write (and say so) when this client lacks
+// ownership rather than letting Foundry throw a permission error mid-hook.
+async function setAwaProgressFlag(actor, flag, value) {
+    if (!flag || !actor?.setFlag) return false;
+    if (!actor.isOwner && !game.user?.isGM) {
+        console.warn(`Yulong Homebrew | Cannot record achievement progress on "${actor.name}" without ownership.`);
+        return false;
+    }
+    await actor.setFlag(AWA_MODULE_ID, flag, value);
+    return true;
+}
+
 async function advanceAwaCounterAchievement(api, actor, achievement, amount = 1) {
     if (!actor?.getFlag || actor.getFlag(AWA_MODULE_ID, achievement.id) === undefined) return;
     const completed = actor.getFlag(AWA_MODULE_ID, achievement.id);
     if (completed) return;
 
+    const target = Number(achievement.target || 0);
     if (!achievement.progressable) {
+        // Matches AWA's checkThrow / checkItemUsedPF, which grant without touching the progress
+        // flag for non-progressable counters. (Its damage and healing path does write the flag -
+        // that difference is handled in applyOneTimeAchievementHooks.)
         await api.grantAchievement(achievement.id, actor);
         return;
     }
 
     const flag = achievement.flag;
     const current = Number(actor.getFlag(AWA_MODULE_ID, flag) || 0) + amount;
-    const target = Number(achievement.target || 0);
     if (current >= target) {
-        await actor.setFlag(AWA_MODULE_ID, flag, target || current);
+        await setAwaProgressFlag(actor, flag, target || current);
         await api.grantAchievement(achievement.id, actor);
     } else {
-        await actor.setFlag(AWA_MODULE_ID, flag, current);
+        await setAwaProgressFlag(actor, flag, current);
     }
 }
 
@@ -504,25 +525,25 @@ function shouldCapTroopSingleTargetDamage(actor, { damage, final, rollOptions, i
     return getTroopSingleTargetDamageCap(actor) !== null;
 }
 
-function withTroopDamageCap(actor, cap, breakdown, callback) {
-    const originalCalculateHealthDelta = actor.calculateHealthDelta;
-    if (typeof originalCalculateHealthDelta !== "function") return callback();
+// PF2e calls `this.calculateHealthDelta` from inside applyDamage, so the only interception point
+// is the actor instance itself. Two things matter here: restoring must remove the own property
+// again (assigning the prototype method back leaves a permanent shadow), and overlapping
+// applications on the same actor must not restore out of order, hence the identity check.
+function withPatchedCalculateHealthDelta(actor, patch, callback) {
+    const original = actor?.calculateHealthDelta;
+    if (typeof original !== "function") return callback();
 
-    let capApplied = false;
-    actor.calculateHealthDelta = function(args) {
-        const delta = Number(args?.delta);
-        if (Number.isFinite(delta) && delta > cap) {
-            if (!capApplied) {
-                capApplied = true;
-                breakdown?.push?.(`Single-target troop damage cap: ${cap}`);
-            }
-            return originalCalculateHealthDelta.call(this, { ...args, delta: cap });
-        }
-        return originalCalculateHealthDelta.call(this, args);
+    const hadOwnProperty = Object.prototype.hasOwnProperty.call(actor, "calculateHealthDelta");
+    const previousOwnValue = hadOwnProperty ? original : undefined;
+    const patched = function(args) {
+        return patch.call(this, original, args);
     };
+    actor.calculateHealthDelta = patched;
 
     const restore = () => {
-        actor.calculateHealthDelta = originalCalculateHealthDelta;
+        if (actor.calculateHealthDelta !== patched) return;
+        if (hadOwnProperty) actor.calculateHealthDelta = previousOwnValue;
+        else delete actor.calculateHealthDelta;
     };
 
     try {
@@ -534,6 +555,21 @@ function withTroopDamageCap(actor, cap, breakdown, callback) {
         restore();
         throw error;
     }
+}
+
+function withTroopDamageCap(actor, cap, breakdown, callback) {
+    let capApplied = false;
+    return withPatchedCalculateHealthDelta(actor, function(original, args) {
+        const delta = Number(args?.delta);
+        if (Number.isFinite(delta) && delta > cap) {
+            if (!capApplied) {
+                capApplied = true;
+                breakdown?.push?.(`Single-target troop damage cap: ${cap}`);
+            }
+            return original.call(this, { ...args, delta: cap });
+        }
+        return original.call(this, args);
+    }, callback);
 }
 
 function escapeYulongHTML(value) {
@@ -605,25 +641,7 @@ async function createTroopAreaWeaknessAdvisorMessage(data) {
 }
 
 function withTroopAreaWeaknessAdvisor(actor, context, callback) {
-    const originalCalculateHealthDelta = actor.calculateHealthDelta;
-    if (typeof originalCalculateHealthDelta !== "function") return callback();
-
     let capturedDamage = null;
-    actor.calculateHealthDelta = function(args) {
-        const delta = Number(args?.delta);
-        const result = originalCalculateHealthDelta.call(this, args);
-        if (Number.isFinite(delta) && delta > 0) {
-            capturedDamage = {
-                delta,
-                totalApplied: Number(result?.totalApplied)
-            };
-        }
-        return result;
-    };
-
-    const restore = () => {
-        actor.calculateHealthDelta = originalCalculateHealthDelta;
-    };
     const maybeCreateAdvisor = () => {
         if (!capturedDamage) return;
         const data = {
@@ -635,21 +653,27 @@ function withTroopAreaWeaknessAdvisor(actor, context, callback) {
             .catch(error => console.warn("Yulong Homebrew | Failed to create troop area weakness advisor card.", error));
     };
 
-    try {
+    return withPatchedCalculateHealthDelta(actor, function(original, args) {
+        const delta = Number(args?.delta);
+        const result = original.call(this, args);
+        if (Number.isFinite(delta) && delta > 0) {
+            capturedDamage = {
+                delta,
+                totalApplied: Number(result?.totalApplied)
+            };
+        }
+        return result;
+    }, () => {
         const result = callback();
         if (result && typeof result.then === "function") {
             return result.then(value => {
                 maybeCreateAdvisor();
                 return value;
-            }).finally(restore);
+            });
         }
         maybeCreateAdvisor();
-        restore();
         return result;
-    } catch (error) {
-        restore();
-        throw error;
-    }
+    });
 }
 
 function fromUuidSyncSafe(uuid) {
@@ -899,24 +923,45 @@ function clearPatreonIncapacitationResult(context) {
     if (removedAdjustment && context.rollTwice === "keep-higher") delete context.rollTwice;
 }
 
-function temporarilySuppressPatreonIncapacitationMode(callback) {
-    const originalGet = game.settings.get.bind(game.settings);
-    game.settings.get = function(namespace, key, ...args) {
-        if (namespace === PATREON_MODULE_ID && key === "incapacitation") return "no";
-        return originalGet(namespace, key, ...args);
-    };
+// patreon-v3 reads its incapacitation mode straight from settings during a check roll, so the
+// only way to opt a single roll out is to intercept the read. Swapping game.settings.get in and
+// out around each roll is not re-entrant: an overlapping roll captures the already-patched
+// function as its "original" and restoring out of order strands the patch forever. Instead the
+// interceptor is installed once and stays inert until a suppression scope raises the depth.
+let patreonIncapacitationSuppressionDepth = 0;
+let patreonIncapacitationSettingsGet = null;
 
-    const restore = () => {
-        game.settings.get = originalGet;
+function installPatreonIncapacitationSettingsInterceptor() {
+    if (patreonIncapacitationSettingsGet && game.settings.get === patreonIncapacitationSettingsGet) return;
+
+    const previousGet = game.settings.get.bind(game.settings);
+    patreonIncapacitationSettingsGet = function(namespace, key, ...args) {
+        if (patreonIncapacitationSuppressionDepth > 0
+            && namespace === PATREON_MODULE_ID
+            && key === "incapacitation") return "no";
+        return previousGet(namespace, key, ...args);
+    };
+    game.settings.get = patreonIncapacitationSettingsGet;
+}
+
+function temporarilySuppressPatreonIncapacitationMode(callback) {
+    installPatreonIncapacitationSettingsInterceptor();
+    patreonIncapacitationSuppressionDepth += 1;
+
+    let released = false;
+    const release = () => {
+        if (released) return;
+        released = true;
+        patreonIncapacitationSuppressionDepth = Math.max(0, patreonIncapacitationSuppressionDepth - 1);
     };
 
     try {
         const result = callback();
-        if (result && typeof result.finally === "function") return result.finally(restore);
-        restore();
+        if (result && typeof result.finally === "function") return result.finally(release);
+        release();
         return result;
     } catch (error) {
-        restore();
+        release();
         throw error;
     }
 }
@@ -1240,13 +1285,27 @@ function installToolbeltCompat() {
         return;
     }
 
+    if (parser.__yulongToolbeltCompatInstalled) return;
+
+    try {
+        installToolbeltCompatOn(parser);
+    } catch (error) {
+        // Leave the install flag unset so a later `ready` (or a manual retry) can try again
+        // instead of silently running with a half-wired bridge.
+        console.error("Yulong Homebrew | Failed to install the PF2e Holodeck / Toolbelt compatibility bridge.", error);
+        return;
+    }
+
+    parser.__yulongToolbeltCompatInstalled = MODULE_ID;
+    console.log("Yulong Homebrew | PF2e Holodeck Toolbelt compatibility ready.");
+}
+
+function installToolbeltCompatOn(parser) {
     const TOOLBELT_PENDING_TIMEOUT_MS = 30000;
     const TOOLBELT_HP_CHANGE_TIMEOUT_MS = 5000;
     const AWA_PENDING_TIMEOUT_MS = 5000;
     const HOLODECK_PENDING_SOURCE_TIMEOUT_MS = 5000;
-
-    if (parser.__yulongToolbeltCompatInstalled) return;
-    parser.__yulongToolbeltCompatInstalled = MODULE_ID;
+    const YULONG_KEY_SET_LIMIT = 2000;
 
     parser.processedToolbeltApplications ??= new Set();
     parser.processedAchievementApplications ??= new Set();
@@ -1260,6 +1319,18 @@ function installToolbeltCompat() {
     window.yulongHomebrew ??= {};
     window.yulongHomebrew.awaHandledApplications = parser.awaHandledApplications;
     window.yulongHomebrew.awaHandledApplicationLooseKeys = parser.awaHandledApplicationLooseKeys;
+
+    // Every dedupe cache below is append-only. Sets iterate in insertion order, so dropping from
+    // the front evicts the oldest keys and keeps a long session from growing without bound.
+    parser.rememberYulongKey ??= function(set, key, limit = YULONG_KEY_SET_LIMIT) {
+        if (!set || key === undefined || key === null) return;
+        set.add(key);
+        while (set.size > limit) {
+            const oldest = set.values().next().value;
+            if (oldest === undefined) break;
+            set.delete(oldest);
+        }
+    };
 
     parser.isYulongPrimaryGM ??= function() {
         if (!game.user?.isGM) return false;
@@ -1279,12 +1350,18 @@ function installToolbeltCompat() {
         return moduleFlags.targetHelper || moduleFlags;
     };
 
+    // Target Helper re-encodes and writes its whole flag object on every change (setMessageData ->
+    // setFlag), so `changed` always carries the complete `applied` map even when nothing was
+    // applied this time. Treat an empty map as "no applications" and never assume the entries in
+    // `changed` are only the new ones - see getChangedToolbeltApplicationEntries.
     parser.hasToolbeltAppliedUpdate ??= function(changed) {
         if (!changed) return false;
         const direct = foundry.utils.getProperty(changed, "flags.pf2e-toolbelt.applied");
         const targetHelper = foundry.utils.getProperty(changed, "flags.pf2e-toolbelt.targetHelper.applied");
-        if (direct || targetHelper) return true;
-        return Object.keys(foundry.utils.flattenObject(changed)).some(k => k.includes("flags.pf2e-toolbelt") && k.includes(".applied"));
+        for (const applied of [direct, targetHelper]) {
+            if (applied && typeof applied === "object" && Object.keys(applied).length > 0) return true;
+        }
+        return Object.keys(foundry.utils.flattenObject(changed)).some(k => k.includes("flags.pf2e-toolbelt") && k.includes(".applied."));
     };
 
     parser.getToolbeltTargetDocument ??= function(targetId, targetRefs = []) {
@@ -1335,7 +1412,6 @@ function installToolbeltCompat() {
         return variants[variantId]
             || variants[String(variantId)]
             || variants.null
-            || variants["null"]
             || Object.values(variants).find(variant => variant?.dc !== undefined)
             || null;
     };
@@ -1372,6 +1448,9 @@ function installToolbeltCompat() {
         const variants = data?.saveVariants;
         if (!variants || typeof variants !== "object") return [];
 
+        // Best-effort narrowing only: Target Helper rewrites the whole flag, so in practice every
+        // save shows up in `changed`. hasProcessedToolbeltSaveEntry is what actually prevents
+        // replays.
         const changedEntries = this.getChangedToolbeltSaveEntries(changed);
         const changedKeys = new Set(changedEntries.map(entry => `${entry.variantId}:${entry.targetId}`));
         const entries = [];
@@ -1422,6 +1501,40 @@ function installToolbeltCompat() {
 
     parser.getToolbeltSaveKey ??= function(messageId, entry) {
         return `${messageId}:${entry.variantId}:${entry.targetId}:${this.getToolbeltSaveEntryFingerprint(entry)}`;
+    };
+
+    parser.getYulongLedgerLogs ??= function(ledger) {
+        if (!ledger) return [];
+        return Array.isArray(ledger.masterLog) ? ledger.masterLog : Object.values(ledger.masterLog || {});
+    };
+
+    // The in-memory dedupe caches are wiped by a page reload, but Holodeck restores its ledger
+    // from the world backup. Because Target Helper rewrites its whole flag on every change, a
+    // single later update would otherwise replay every historical save on that message. Checking
+    // the restored ledger for our own marker makes the dedupe survive a reload.
+    parser.hasProcessedToolbeltSaveEntry ??= function(saveKey) {
+        if (!saveKey) return false;
+        if (this.processedToolbeltSaveEntries.has(saveKey)) return true;
+
+        const recorded = [this.ledger, this.explorationLedger].some(ledger =>
+            this.getYulongLedgerLogs(ledger).some(entry => entry?.yulongToolbeltSaveKey === saveKey));
+        if (recorded) this.rememberYulongKey(this.processedToolbeltSaveEntries, saveKey);
+        return recorded;
+    };
+
+    parser.getToolbeltApplicationMessageId ??= function(messageId, entry) {
+        return `${messageId}-toolbelt-${entry.targetId}-${entry.rollIndex}`;
+    };
+
+    parser.hasProcessedToolbeltApplication ??= function(message, entry) {
+        const key = this.getToolbeltApplicationKey(message.id, entry.targetId, entry.rollIndex);
+        if (this.processedToolbeltApplications.has(key)) return true;
+
+        const syntheticId = this.getToolbeltApplicationMessageId(message.id, entry);
+        const recorded = [this.ledger, this.explorationLedger].some(ledger =>
+            this.getYulongLedgerLogs(ledger).some(logEntry => logEntry?.yulongMessageId === syntheticId));
+        if (recorded) this.rememberYulongKey(this.processedToolbeltApplications, key);
+        return recorded;
     };
 
     parser.buildToolbeltSyntheticD20Roll ??= function({ die, total, outcome, options = [] } = {}) {
@@ -1475,6 +1588,100 @@ function installToolbeltCompat() {
     parser.getHolodeckResolvedActorName ??= function(actor, alias) {
         const raw = this.getCanonicalName(actor, alias || actor?.name || "Unknown");
         return this.resolveOwner(raw, actor, alias || raw);
+    };
+
+    parser.getHolodeckSpeakerTokenDocument ??= function(message) {
+        const speaker = message?.speaker;
+        if (!speaker?.token) return null;
+        const scene = game.scenes?.get?.(speaker.scene)
+            || (canvas.scene?.id === speaker.scene ? canvas.scene : null);
+        return scene?.tokens?.get?.(speaker.token) || null;
+    };
+
+    parser.getHolodeckActiveTokenDocuments ??= function(actor) {
+        if (!actor || typeof actor.getActiveTokens !== "function") return [];
+        try {
+            return actor.getActiveTokens(false, true) || [];
+        } catch {
+            return [];
+        }
+    };
+
+    parser.buildHolodeckSourceIdentity ??= function(actor, { speakerToken = null, alias = null, trustAlias = false } = {}) {
+        if (!actor) return null;
+        const token = selectHolodeckIdentityToken(
+            actor,
+            speakerToken,
+            this.getHolodeckActiveTokenDocuments(actor)
+        );
+        const preferredAlias = token?.name || (trustAlias ? alias : null) || actor.name;
+        return {
+            actor,
+            token,
+            actorUuid: actor.uuid || null,
+            tokenUuid: token?.uuid || null,
+            alias: preferredAlias || null,
+            name: this.getHolodeckResolvedActorName(actor, preferredAlias),
+            exactToken: Boolean(token || (trustAlias && alias))
+        };
+    };
+
+    parser.serializeHolodeckSourceIdentity ??= function(identity) {
+        if (!identity) return null;
+        return {
+            actorUuid: identity.actorUuid || identity.actor?.uuid || null,
+            tokenUuid: identity.tokenUuid || identity.token?.uuid || null,
+            alias: identity.alias || identity.token?.name || identity.actor?.name || null,
+            exactToken: identity.exactToken === true
+        };
+    };
+
+    parser.getHolodeckMessageOriginActor ??= function(message) {
+        const systemFlags = this.getMessageSystemFlags(message) || {};
+        const origin = fromUuidSyncSafe(systemFlags.origin?.uuid) || message?.item || null;
+        return this.getActorFromDocument(origin);
+    };
+
+    parser.getHolodeckSourceIdentity ??= function(message, explicitActor = null) {
+        const stored = message?.yulongHolodeckSourceIdentity || message?.toolbeltCompat?.sourceIdentity || null;
+        const actor = explicitActor
+            || fromUuidSyncSafe(stored?.actorUuid)
+            || this.getHolodeckMessageOriginActor(message);
+        if (!actor) return null;
+
+        if (stored) {
+            return this.buildHolodeckSourceIdentity(actor, {
+                speakerToken: fromUuidSyncSafe(stored.tokenUuid),
+                alias: stored.alias,
+                trustAlias: stored.exactToken === true
+            });
+        }
+
+        const applied = this.getMessageSystemFlags(message)?.appliedDamage;
+        if (!applied) {
+            const speakerToken = this.getHolodeckSpeakerTokenDocument(message);
+            return this.buildHolodeckSourceIdentity(actor, {
+                speakerToken,
+                alias: message?.speaker?.alias || message?.alias,
+                trustAlias: Boolean(speakerToken)
+            });
+        }
+
+        return this.buildHolodeckSourceIdentity(actor);
+    };
+
+    parser.getHolodeckAppliedTargetToken ??= function(message) {
+        const appliedUuid = this.getMessageSystemFlags(message)?.appliedDamage?.uuid;
+        const targetDocument = fromUuidSyncSafe(appliedUuid);
+        if (!targetDocument) return null;
+        if (targetDocument.documentName === "Token") return targetDocument;
+
+        const targetActor = this.getActorFromDocument(targetDocument);
+        return selectHolodeckIdentityToken(
+            targetActor,
+            this.getHolodeckSpeakerTokenDocument(message) || targetActor?.token || null,
+            this.getHolodeckActiveTokenDocuments(targetActor)
+        );
     };
 
     parser.hasRecentHolodeckSaveLog ??= function(targetName, outcome) {
@@ -1541,19 +1748,6 @@ function installToolbeltCompat() {
         ));
     };
 
-    parser.hasHookHandlerContaining ??= function(eventName, marker) {
-        const hooks = Hooks.events?.[eventName] || Hooks._hooks?.[eventName] || [];
-        return hooks.some(hook => {
-            const fn = hook?.fn || hook;
-            if (typeof fn !== "function") return false;
-            try {
-                return Function.prototype.toString.call(fn).includes(marker);
-            } catch {
-                return false;
-            }
-        });
-    };
-
     parser.getHolodeckLedger ??= function() {
         const isCombatPhase = (canvas.scene && canvas.scene.getFlag("pf2e-holodeck", "active"))
             || (game.combat && game.combat.active);
@@ -1565,6 +1759,47 @@ function installToolbeltCompat() {
                     ? `combat:${game.combat.id}`
                     : "exploration",
             isCombatPhase
+        };
+    };
+
+    // Several fallbacks below need to hand Holodeck's parser a fuller picture of a message than
+    // PF2e actually stores (an inferred outcome, a resolved target, a damage total on
+    // appliedDamage). Writing that onto the live ChatMessage would mutate document source data
+    // that PF2e and Target Helper read back when applying damage, and any unrelated
+    // `message.update({flags})` could persist our guesses. So we parse a detached view instead:
+    // a plain snapshot whose system flag branch is copied shallowly down to the two objects we
+    // touch. Rolls and documents are shared by reference - nothing mutates them.
+    parser.createYulongParseView ??= function(message) {
+        const systemKey = this.getMessageSystemKey(message);
+        const flags = { ...(message.flags || {}) };
+        const systemFlags = systemKey ? message.flags?.[systemKey] : null;
+
+        if (systemFlags) {
+            const copy = { ...systemFlags };
+            if (systemFlags.context) copy.context = { ...systemFlags.context };
+            if (systemFlags.appliedDamage) copy.appliedDamage = { ...systemFlags.appliedDamage };
+            flags[systemKey] = copy;
+        }
+
+        return {
+            id: message.id ?? null,
+            actor: message.actor ?? null,
+            item: message.item ?? null,
+            speaker: message.speaker,
+            alias: message.alias,
+            flavor: message.flavor,
+            content: message.content,
+            rolls: message.rolls,
+            isDamageRoll: message.isDamageRoll,
+            isReroll: message.isReroll,
+            whisper: message.whisper,
+            blind: message.blind,
+            flags,
+            toolbeltCompat: message.toolbeltCompat,
+            yulongHolodeckSourceIdentity: message.yulongHolodeckSourceIdentity,
+            yulongToolbeltApplicationKey: message.yulongToolbeltApplicationKey,
+            yulongHpSnapshotTrusted: message.yulongHpSnapshotTrusted,
+            yulongSourceMessage: message
         };
     };
 
@@ -1645,14 +1880,15 @@ function installToolbeltCompat() {
         const sourceActor = inherited
             ? fromUuidSyncSafe(inherited.sourceActorUuid) || game.actors.get(inherited.sourceActorId)
             : this.getActorFromDocument(origin);
-        const sourceName = sourceActor
-            ? this.getHolodeckResolvedActorName(sourceActor, sourceActor.name)
-            : inherited?.sourceName;
+        const sourceIdentity = sourceActor ? this.getHolodeckSourceIdentity(message, sourceActor) : null;
+        const sourceName = sourceIdentity?.name || inherited?.sourceName;
         if (!sourceName) return false;
 
         const record = {
             sourceActorId: sourceActor?.id || inherited?.sourceActorId || null,
             sourceActorUuid: sourceActor?.uuid || inherited?.sourceActorUuid || null,
+            sourceTokenUuid: sourceIdentity?.tokenUuid || inherited?.sourceTokenUuid || null,
+            sourceAlias: sourceIdentity?.alias || inherited?.sourceAlias || null,
             sourceName,
             sourceType: sourceActor?.type || inherited?.sourceType || "npc",
             sourceLevel: Number(sourceActor?.system?.details?.level?.value ?? inherited?.sourceLevel ?? 0) || 0,
@@ -1765,6 +2001,10 @@ function installToolbeltCompat() {
     parser.parsePersistentDamageRoll ??= function(message) {
         const context = this.getPersistentDamageMessageContext(message);
         if (!context?.isDamageRoll || !Array.isArray(message?.rolls) || message.rolls.length === 0) return false;
+        // Without a recorded originator there is nobody to re-attribute the tick to, and booking it
+        // under the placeholder name would add a fake actor row to the report. Fall through to
+        // Holodeck's own parsing instead.
+        if (!context.resolved) return false;
 
         const key = this.getHolodeckParseKey(message);
         if (key && this.yulongProcessedHolodeckMessages.has(key)) return true;
@@ -1806,7 +2046,7 @@ function installToolbeltCompat() {
         };
         stats.history.push(logEntry);
         ledger.masterLog.push(logEntry);
-        if (key) this.yulongProcessedHolodeckMessages.add(key);
+        if (key) this.rememberYulongKey(this.yulongProcessedHolodeckMessages, key);
         if (isCombatPhase && typeof this.saveLiveBackup === "function") this.saveLiveBackup();
         return true;
     };
@@ -1902,7 +2142,8 @@ function installToolbeltCompat() {
         }
 
         if (!context.target?.token) {
-            const targetDoc = this.getHolodeckSingleTargetDocument(message);
+            const targetDoc = this.getHolodeckAppliedTargetToken(message)
+                || this.getHolodeckSingleTargetDocument(message);
             if (targetDoc?.uuid) {
                 context.target = {
                     actor: targetDoc.actor?.uuid || targetDoc.uuid,
@@ -1979,6 +2220,23 @@ function installToolbeltCompat() {
         if (!Number.isFinite(amount) || amount <= 0) return null;
 
         const actor = fromUuidSyncSafe(appliedDamage.uuid);
+        const isHealing = appliedDamage.isHealing === true;
+
+        // Preferred source: the HP values captured in preUpdateActor, which are exact.
+        const recorded = this.peekRecentHpChange(actor);
+        if (recorded && Number.isFinite(Number(recorded.previousHp)) && Number.isFinite(Number(recorded.currentHp))) {
+            return {
+                amount,
+                isHealing,
+                previousHp: Number(recorded.previousHp),
+                currentHp: Number(recorded.currentHp),
+                trusted: true
+            };
+        }
+
+        // Fallback: read the actor now and walk the update deltas back. Only correct while the
+        // actor still holds exactly the value this application produced, which is not guaranteed
+        // on a client that merely received the message, so the result is flagged untrusted.
         const currentHp = Number(actor?.system?.attributes?.hp?.value);
         const hpValueUpdate = hpUpdates.find(update => update.path === "system.attributes.hp.value");
         const hpDelta = Number(hpValueUpdate?.value);
@@ -1986,9 +2244,10 @@ function installToolbeltCompat() {
 
         return {
             amount,
-            isHealing: appliedDamage.isHealing === true,
+            isHealing,
             previousHp,
-            currentHp: Number.isFinite(currentHp) ? currentHp : undefined
+            currentHp: Number.isFinite(currentHp) ? currentHp : undefined,
+            trusted: false
         };
     };
 
@@ -2018,6 +2277,9 @@ function installToolbeltCompat() {
             appliedDamage.currentHp = summary.currentHp;
             changed = true;
         }
+        // Recorded on the view (not the flag) so kill normalisation knows whether it may act on a
+        // "this was not a kill" verdict or should only ever add one.
+        message.yulongHpSnapshotTrusted = summary.trusted === true;
         return changed;
     };
 
@@ -2114,19 +2376,26 @@ function installToolbeltCompat() {
 
     parser.normalizeHolodeckDamageTypes ??= function(message, ledger, beforeTypes, newLogs) {
         let changed = false;
+        // The baseline has to advance per entry: if one message books two Damage logs against the
+        // same target, comparing both against the pre-parse snapshot would attribute the first
+        // entry's amounts to the second and then subtract them twice.
+        const baseline = { ...(beforeTypes || {}) };
+
         for (const logEntry of newLogs || []) {
             if (logEntry.type !== "Damage" || !logEntry.target || logEntry.target === "None") continue;
             const targetStats = ledger?.actors?.[logEntry.target];
             if (!targetStats) continue;
 
-            const rawDiff = this.getDamageTypeDiff(beforeTypes?.[logEntry.target] || {}, targetStats.damageTakenTypes || {});
+            const rawDiff = this.getDamageTypeDiff(baseline[logEntry.target] || {}, targetStats.damageTakenTypes || {});
             const normalized = this.getNormalizedDamageTypeMap(message, logEntry) || rawDiff;
             logEntry.yulongDamageTypeAdjustments = foundry.utils.deepClone(normalized);
 
-            if (JSON.stringify(rawDiff) === JSON.stringify(normalized)) continue;
-            this.addDamageTypeMap(targetStats, rawDiff, -1);
-            this.addDamageTypeMap(targetStats, normalized, 1);
-            changed = true;
+            if (JSON.stringify(rawDiff) !== JSON.stringify(normalized)) {
+                this.addDamageTypeMap(targetStats, rawDiff, -1);
+                this.addDamageTypeMap(targetStats, normalized, 1);
+                changed = true;
+            }
+            baseline[logEntry.target] = foundry.utils.deepClone(targetStats.damageTakenTypes || {});
         }
         return changed;
     };
@@ -2135,13 +2404,34 @@ function installToolbeltCompat() {
         return `${message?.flavor || ""} ${message?.content || ""}`.replace(/<[^>]*>?/gm, " ");
     };
 
-    parser.getHolodeckMitigatedTotal ??= function(message) {
-        const fullText = this.getHolodeckMessageText(message);
-        const mitRegex = /(?:reduced by|resist|absorb|shield block|mitigat|blocked)[^\d]*(\d+)/ig;
-        let total = 0;
-        let match;
-        while ((match = mitRegex.exec(fullText)) !== null) total += Number(match[1]) || 0;
-        return total;
+    parser.snapshotHolodeckMitigated ??= function(ledger) {
+        const snapshot = {};
+        for (const [name, stats] of Object.entries(ledger?.actors || {})) {
+            snapshot[name] = Number(stats?.mitigated || 0);
+        }
+        return snapshot;
+    };
+
+    // We used to re-derive the mitigated amount with our own regex, which did not match the one
+    // Holodeck books with - so reverting or re-attributing an entry subtracted a number that had
+    // never been added. Diffing the ledger instead records exactly what Holodeck credited, and
+    // naturally records nothing for healing entries (which Holodeck never books mitigation for).
+    parser.assignHolodeckMitigatedAmounts ??= function(ledger, beforeMitigated, newLogs) {
+        const unassigned = {};
+        for (const logEntry of newLogs || []) {
+            const target = logEntry?.target;
+            if (!target || target === "None") continue;
+            if (!["Damage", "Mitigation"].includes(logEntry.type)) continue;
+
+            if (unassigned[target] === undefined) {
+                const after = Number(ledger?.actors?.[target]?.mitigated || 0);
+                unassigned[target] = Math.max(0, after - Number(beforeMitigated?.[target] || 0));
+            }
+            if (unassigned[target] <= 0) continue;
+
+            logEntry.yulongMitigatedAmount = unassigned[target];
+            unassigned[target] = 0;
+        }
     };
 
     parser.getHolodeckAdvancedAdjustments ??= function(message, ledger, logEntry) {
@@ -2194,9 +2484,21 @@ function installToolbeltCompat() {
         if (!newStats) return false;
 
         const damage = Number(logEntry.damageVal || 0);
+        const healing = Number(logEntry.healVal || 0);
         if (logEntry.type === "Damage" && damage > 0) {
             if (oldStats) oldStats.damageDealt = Math.max(0, Number(oldStats.damageDealt || 0) - damage);
             newStats.damageDealt = Number(newStats.damageDealt || 0) + damage;
+            const advanced = logEntry.yulongAdvancedAdjustments || {};
+            for (const key of ["huntedShotDmg", "surgeFriendlyDmg"]) {
+                const value = Number(advanced[key] || 0);
+                if (value <= 0) continue;
+                if (oldStats?.advanced) oldStats.advanced[key] = Math.max(0, Number(oldStats.advanced[key] || 0) - value);
+                newStats.advanced ??= {};
+                newStats.advanced[key] = Number(newStats.advanced[key] || 0) + value;
+            }
+        } else if (logEntry.type === "Heal" && healing > 0) {
+            if (oldStats) oldStats.healingDealt = Math.max(0, Number(oldStats.healingDealt || 0) - healing);
+            newStats.healingDealt = Number(newStats.healingDealt || 0) + healing;
         }
 
         if (hasHolodeckKillMarker(logEntry.result)) {
@@ -2208,6 +2510,8 @@ function installToolbeltCompat() {
         const actionKey = this.getHolodeckActionKey(logEntry);
         if (logEntry.type === "Damage" && damage > 0) {
             this.moveHolodeckNestedSourceValue(targetStats?.damageTakenSources, oldSource, sourceName, actionKey, damage);
+        } else if (logEntry.type === "Heal" && healing > 0) {
+            this.moveHolodeckNestedSourceValue(targetStats?.healingReceivedSources, oldSource, sourceName, actionKey, healing);
         }
 
         const mitigated = Number(logEntry.yulongMitigatedAmount || 0);
@@ -2229,14 +2533,49 @@ function installToolbeltCompat() {
         return true;
     };
 
+    parser.removeEmptyHolodeckActorStats ??= function(ledger, names = []) {
+        for (const name of new Set(names)) {
+            const stats = ledger?.actors?.[name];
+            if (stats && !holodeckStatsHaveValues(stats)) delete ledger.actors[name];
+        }
+    };
+
+    parser.correctHolodeckSourceIdentity ??= function(message, ledger, newLogs) {
+        if (!this.getMessageSystemFlags(message)?.appliedDamage) return false;
+        if (this.getPersistentDamageMessageContext(message)) return false;
+        const identity = this.getHolodeckSourceIdentity(message);
+        if (!identity?.exactToken || !identity.name) return false;
+
+        let changed = false;
+        const previousSources = [];
+        for (const logEntry of newLogs || []) {
+            if (!["Damage", "Heal", "Mitigation"].includes(logEntry.type)) continue;
+            const previousSource = logEntry.source;
+            previousSources.push(previousSource);
+            const moved = this.reassignHolodeckLogSource(ledger, logEntry, identity.name, identity.actor);
+            logEntry.yulongSourceIdentity = {
+                ...this.serializeHolodeckSourceIdentity(identity),
+                previousSource,
+                source: identity.name
+            };
+            changed = moved || changed;
+        }
+        this.removeEmptyHolodeckActorStats(ledger, previousSources);
+        return changed;
+    };
+
     parser.correctPersistentDamageHolodeckSources ??= function(message, ledger, newLogs) {
         const context = this.getPersistentDamageMessageContext(message);
         if (!context || !this.getMessageSystemFlags(message)?.appliedDamage) return false;
+        // Same reasoning as parsePersistentDamageRoll: never move stats onto the placeholder name.
+        if (!context.resolved) return false;
 
         let changed = false;
+        const previousSources = [];
         for (const logEntry of newLogs || []) {
             if (!["Damage", "Mitigation"].includes(logEntry.type)) continue;
             const previousSource = logEntry.source;
+            previousSources.push(previousSource);
             const moved = this.reassignHolodeckLogSource(
                 ledger,
                 logEntry,
@@ -2252,6 +2591,7 @@ function installToolbeltCompat() {
             };
             changed = moved || changed;
         }
+        this.removeEmptyHolodeckActorStats(ledger, previousSources);
         return changed;
     };
 
@@ -2260,6 +2600,11 @@ function installToolbeltCompat() {
         const previousHp = Number(applied?.previousHp);
         const currentHp = Number(applied?.currentHp);
         if (!Number.isFinite(previousHp) || !Number.isFinite(currentHp)) return false;
+
+        // Only HP values captured in preUpdateActor are exact. With a reconstructed snapshot we
+        // may promote a missed kill, but we must never revoke one Holodeck already booked - a
+        // wrong "no kill" verdict is worse than leaving its own heuristic alone.
+        const trusted = message?.yulongHpSnapshotTrusted === true;
 
         let changed = false;
         for (const logEntry of newLogs || []) {
@@ -2272,6 +2617,8 @@ function installToolbeltCompat() {
                 isHealing: applied?.isHealing === true
             });
             const hasMarker = hasHolodeckKillMarker(logEntry.result);
+            if (!shouldCount && !trusted) continue;
+
             const sourceStats = ledger?.actors?.[logEntry.source];
             if (sourceStats && hasMarker !== shouldCount) {
                 sourceStats.kills = Math.max(0, Number(sourceStats.kills || 0) + (shouldCount ? 1 : -1));
@@ -2356,19 +2703,23 @@ function installToolbeltCompat() {
     parser.revertHolodeckMessageStats ??= function(message) {
         if (!message?.id) return false;
         let reverted = false;
+        const revertedKeys = new Set();
         for (const ledger of [this.ledger, this.explorationLedger].filter(Boolean)) {
-            const logs = Array.isArray(ledger.masterLog) ? ledger.masterLog : Object.values(ledger.masterLog || {});
+            const logs = this.getYulongLedgerLogs(ledger);
             for (let index = logs.length - 1; index >= 0; index--) {
                 const logEntry = logs[index];
                 if (logEntry?.yulongMessageId !== message.id) continue;
                 if (this.subtractHolodeckLogEntry(ledger, logEntry)) {
+                    if (logEntry.yulongParseKey) revertedKeys.add(logEntry.yulongParseKey);
                     logs.splice(index, 1);
                     reverted = true;
                 }
             }
             ledger.masterLog = logs;
         }
-        if (reverted) this.yulongProcessedHolodeckMessages.delete(this.getHolodeckParseKey(message));
+        // Take the key from the log entries: recomputing it from the live message would miss the
+        // applied-damage total we only ever add to the detached parse view.
+        for (const key of revertedKeys) this.yulongProcessedHolodeckMessages.delete(key);
         return reverted;
     };
 
@@ -2398,15 +2749,19 @@ function installToolbeltCompat() {
         const targetDoc = fromUuidSyncSafe(targetUuid);
         const targetActor = targetDoc?.actor || targetDoc || null;
         const sourceActor = this.getHolodeckMessageSourceActor(message);
+        const sourceIdentity = this.getHolodeckSourceIdentity(message, sourceActor);
         const originUuid = systemFlags.origin?.uuid || message.item?.uuid || sourceActor?.uuid || null;
 
         window.yulongHomebrew ??= {};
+        const pendingToolbelt = window.yulongHomebrew.pendingToolbeltApplication;
         window.yulongHomebrew.pendingHolodeckDamageSource = {
             messageId: message.id,
             rollIndex: Number(targetRow?.dataset.targetRollIndex) || 0,
+            applicationKey: pendingToolbelt?.messageId === message.id ? pendingToolbelt.applicationKey : null,
             sourceActorId: sourceActor?.id || null,
             sourceActorUuid: sourceActor?.uuid || null,
             sourceActorName: sourceActor?.name || null,
+            sourceIdentity: this.serializeHolodeckSourceIdentity(sourceIdentity),
             originUuid,
             targetUuid,
             targetActorId: targetActor?.id || null,
@@ -2418,7 +2773,7 @@ function installToolbeltCompat() {
     parser.applyPendingHolodeckDamageSource ??= function(message) {
         const systemFlags = this.getMessageSystemFlags(message);
         const applied = systemFlags?.appliedDamage;
-        if (!systemFlags || !applied || systemFlags.origin?.uuid) return false;
+        if (!systemFlags || !applied) return false;
 
         const compat = window.yulongHomebrew;
         const pending = compat?.pendingHolodeckDamageSource;
@@ -2437,59 +2792,78 @@ function installToolbeltCompat() {
             || pending.targetUuid === targetDoc?.uuid
             || pending.targetUuid === applied.uuid;
         if (!targetMatches) return false;
-        if (!pending.originUuid) return false;
 
-        systemFlags.origin = { uuid: pending.originUuid };
+        if (!systemFlags.origin?.uuid && pending.originUuid) systemFlags.origin = { uuid: pending.originUuid };
+        const pendingTargetDoc = fromUuidSyncSafe(pending.targetUuid);
+        if (!systemFlags.context?.target?.token && pendingTargetDoc?.documentName === "Token") {
+            systemFlags.context ??= {};
+            systemFlags.context.target = {
+                actor: pendingTargetDoc.actor?.uuid || targetActor?.uuid || pendingTargetDoc.uuid,
+                token: pendingTargetDoc.uuid
+            };
+        }
+        if (pending.sourceIdentity) message.yulongHolodeckSourceIdentity = pending.sourceIdentity;
+        if (pending.applicationKey) message.yulongToolbeltApplicationKey = pending.applicationKey;
         delete compat.pendingHolodeckDamageSource;
-        return true;
+        return Boolean(systemFlags.origin?.uuid || message.yulongHolodeckSourceIdentity);
     };
 
     parser.parseMessageWithYulongCompat ??= function(original, message) {
         if (!message) return original.call(this, message);
         if (this.isAoEEasyResolveMessage(message)) return original.call(this, message);
 
-        this.applyHolodeckRollContextFallbacks(message);
-        this.augmentPF2eAppliedDamage(message);
-        this.applyPendingHolodeckDamageSource(message);
-        this.recordPersistentDamageSources(message);
-        if (this.parsePersistentDamageRoll(message)) return;
+        // Everything from here on reads and writes the detached view, never the live document.
+        const view = this.createYulongParseView(message);
 
-        const key = this.getHolodeckParseKey(message);
+        this.applyPendingHolodeckDamageSource(view);
+        this.applyHolodeckRollContextFallbacks(view);
+        this.augmentPF2eAppliedDamage(view);
+        this.recordPersistentDamageSources(view);
+        if (this.parsePersistentDamageRoll(view)) return;
+
+        const key = this.getHolodeckParseKey(view);
         if (key && this.yulongProcessedHolodeckMessages.has(key)) return;
 
         const { ledger, isCombatPhase } = this.getHolodeckLedger();
         const beforeLength = Array.isArray(ledger?.masterLog) ? ledger.masterLog.length : 0;
         const beforeTypes = this.snapshotDamageTakenTypes(ledger);
+        const beforeMitigated = this.snapshotHolodeckMitigated(ledger);
 
-        const result = original.call(this, message);
+        const result = original.call(this, view);
 
         const logs = Array.isArray(ledger?.masterLog) ? ledger.masterLog : [];
         const newLogs = logs.slice(beforeLength);
-        if (newLogs.length > 0 && key) this.yulongProcessedHolodeckMessages.add(key);
+        if (newLogs.length > 0 && key) this.rememberYulongKey(this.yulongProcessedHolodeckMessages, key);
 
+        const applied = this.getMessageSystemFlags(view)?.appliedDamage;
         for (const logEntry of newLogs) {
-            logEntry.yulongMessageId = message.id || null;
+            logEntry.yulongMessageId = view.id || null;
             logEntry.yulongParseKey = key;
-            if (message.toolbeltCompat?.saveKey) logEntry.yulongToolbeltSaveKey = message.toolbeltCompat.saveKey;
-            const mitigated = this.getHolodeckMitigatedTotal(message);
-            if (mitigated > 0) logEntry.yulongMitigatedAmount = mitigated;
-            const applied = this.getMessageSystemFlags(message)?.appliedDamage;
+            if (view.toolbeltCompat?.saveKey) logEntry.yulongToolbeltSaveKey = view.toolbeltCompat.saveKey;
             if (applied?.uuid) logEntry.yulongAppliedDamageUuid = applied.uuid;
             if (Number.isFinite(Number(applied?.amount ?? applied?.damage))) {
                 logEntry.yulongAppliedAmount = Number(applied.amount ?? applied.damage);
             }
         }
+        // Must run before the source corrections, which move the recorded mitigation between actors.
+        this.assignHolodeckMitigatedAmounts(ledger, beforeMitigated, newLogs);
 
-        const correctedPersistentSource = this.correctPersistentDamageHolodeckSources(message, ledger, newLogs);
         for (const logEntry of newLogs) {
-            const advancedAdjustments = this.getHolodeckAdvancedAdjustments(message, ledger, logEntry);
+            const advancedAdjustments = this.getHolodeckAdvancedAdjustments(view, ledger, logEntry);
             if (advancedAdjustments) logEntry.yulongAdvancedAdjustments = advancedAdjustments;
         }
-        const normalizedKills = this.normalizeHolodeckKillStats(message, ledger, newLogs);
-        const patchedD20 = this.patchHolodeckRollD20Stats(message, ledger, newLogs);
-        const normalized = this.normalizeHolodeckDamageTypes(message, ledger, beforeTypes, newLogs);
+        const correctedSourceIdentity = this.correctHolodeckSourceIdentity(view, ledger, newLogs);
+        const correctedPersistentSource = this.correctPersistentDamageHolodeckSources(view, ledger, newLogs);
+        const normalizedKills = this.normalizeHolodeckKillStats(view, ledger, newLogs);
+        const patchedD20 = this.patchHolodeckRollD20Stats(view, ledger, newLogs);
+        const normalized = this.normalizeHolodeckDamageTypes(view, ledger, beforeTypes, newLogs);
         const taggedApplication = newLogs.some(logEntry => ["Damage", "Heal", "Mitigation"].includes(logEntry.type));
-        if ((normalized || normalizedKills || correctedPersistentSource || taggedApplication || patchedD20)
+        if (taggedApplication && view.yulongToolbeltApplicationKey) {
+            this.rememberYulongKey(this.processedToolbeltApplications, view.yulongToolbeltApplicationKey);
+            const pending = window.yulongHomebrew?.pendingToolbeltApplication;
+            if (pending?.applicationKey === view.yulongToolbeltApplicationKey) this.clearPendingToolbeltApplication(pending);
+        }
+        if ((normalized || normalizedKills || correctedSourceIdentity || correctedPersistentSource || taggedApplication || patchedD20)
             && isCombatPhase
             && typeof this.saveLiveBackup === "function") this.saveLiveBackup();
         return result;
@@ -2572,6 +2946,24 @@ function installToolbeltCompat() {
             queue.push(change);
             this.recentHpChanges.set(key, queue.slice(-20));
         }
+    };
+
+    // Non-consuming lookup used by the applied-damage summary: the Target Helper bridge still owns
+    // consumption, this only borrows the exact pre/post HP values captured in preUpdateActor.
+    parser.peekRecentHpChange ??= function(actor) {
+        const target = actor?.actor || actor;
+        const now = Date.now();
+        for (const key of [target?.uuid, target?.id].filter(Boolean)) {
+            const queue = this.recentHpChanges.get(key);
+            if (!Array.isArray(queue)) continue;
+            // Newest first: PF2e posts the damage-taken card straight after its own update, so the
+            // latest entry is the one this message describes.
+            for (let index = queue.length - 1; index >= 0; index--) {
+                const change = queue[index];
+                if (now - change.timestamp <= TOOLBELT_HP_CHANGE_TIMEOUT_MS) return change;
+            }
+        }
+        return null;
     };
 
     parser.removeRecentHpChange ??= function(change) {
@@ -2785,8 +3177,8 @@ function installToolbeltCompat() {
 
         if (!this.pendingAwaSourceMatchesActor(pending, actor)) return null;
 
-        compat.awaHandledApplications?.add?.(pending.applicationKey);
-        compat.awaHandledApplicationLooseKeys?.add?.(pending.applicationLooseKey);
+        this.rememberYulongKey(compat.awaHandledApplications, pending.applicationKey);
+        this.rememberYulongKey(compat.awaHandledApplicationLooseKeys, pending.applicationLooseKey);
         delete compat.pendingAwaToolbeltSource;
         return {
             ...pending,
@@ -2831,7 +3223,11 @@ function installToolbeltCompat() {
         return Number.isFinite(current) ? current : null;
     };
 
-    parser.applyAwaDamageHealingStats ??= async function(api, sourceActor, targetActor, damageDelta, changed = {}) {
+    // `hitPoints` must be captured synchronously by the caller, while preUpdateActor is still on
+    // the stack. Reading the actor here would be too late: granting the damage achievements above
+    // awaits actor.update(), by which point the HP change has already landed and the
+    // before/after comparison can no longer see the defeat transition.
+    parser.applyAwaDamageHealingStats ??= async function(api, sourceActor, targetActor, damageDelta, hitPoints = {}) {
         const amount = Math.abs(Number(damageDelta));
         if (!Number.isFinite(amount) || amount <= 0) return;
 
@@ -2846,9 +3242,12 @@ function installToolbeltCompat() {
         if (api.triggerProgressAchievements) await api.triggerProgressAchievements("damage_progressable", sourceActor, amount);
         await this.applyOneTimeAchievementHooks(api, sourceActor, "damage_one_time", amount);
 
-        const previousHp = Number(targetActor?.system?.attributes?.hp?.value);
-        const currentHp = this.getAwaUpdatedHpValue(targetActor, changed);
-        if (isHpDefeatTransition({ previousHp, currentHp, amount, isHealing: false })) {
+        if (isHpDefeatTransition({
+            previousHp: hitPoints.previousHp,
+            currentHp: hitPoints.currentHp,
+            amount,
+            isHealing: false
+        })) {
             await this.applyMonsterKilledAchievementHooks(api, sourceActor, targetActor);
         }
     };
@@ -2874,9 +3273,13 @@ function installToolbeltCompat() {
         const achievements = api.getAchievements?.() || [];
         for (const achievement of achievements) {
             if (achievement.automationHookId !== hookId) continue;
-            if (sourceActor.getFlag("achievements-with-automation", achievement.id) === undefined) continue;
-            if (sourceActor.getFlag("achievements-with-automation", achievement.id)) continue;
-            if (amount >= Number(achievement.target || 0)) await api.grantAchievement(achievement.id, sourceActor);
+            if (sourceActor.getFlag(AWA_MODULE_ID, achievement.id) === undefined) continue;
+            if (sourceActor.getFlag(AWA_MODULE_ID, achievement.id)) continue;
+            if (amount < Number(achievement.target || 0)) continue;
+            // AWA pins the progress flag to the target on completion; do the same so the bar in
+            // its UI does not sit at zero for a completed one-time achievement.
+            await setAwaProgressFlag(sourceActor, achievement.flag, Number(achievement.target || amount));
+            await api.grantAchievement(achievement.id, sourceActor);
         }
     };
 
@@ -2886,8 +3289,8 @@ function installToolbeltCompat() {
 
         for (const achievement of achievements) {
             if (!this.matchesAchievementMonsterFilter(achievement, killedActor)) continue;
-            if (sourceActor.getFlag("achievements-with-automation", achievement.id) === undefined) continue;
-            if (sourceActor.getFlag("achievements-with-automation", achievement.id)) continue;
+            if (sourceActor.getFlag(AWA_MODULE_ID, achievement.id) === undefined) continue;
+            if (sourceActor.getFlag(AWA_MODULE_ID, achievement.id)) continue;
 
             if (!achievement.progressable) {
                 await api.grantAchievement(achievement.id, sourceActor);
@@ -2895,78 +3298,133 @@ function installToolbeltCompat() {
             }
 
             const flag = achievement.flag;
-            const current = Number(sourceActor.getFlag("achievements-with-automation", flag) || 0) + 1;
+            const current = Number(sourceActor.getFlag(AWA_MODULE_ID, flag) || 0) + 1;
             if (current >= Number(achievement.target || 0)) {
-                await sourceActor.setFlag("achievements-with-automation", flag, Number(achievement.target || current));
+                await setAwaProgressFlag(sourceActor, flag, Number(achievement.target || current));
                 await api.grantAchievement(achievement.id, sourceActor);
             } else {
-                await sourceActor.setFlag("achievements-with-automation", flag, current);
+                await setAwaProgressFlag(sourceActor, flag, current);
             }
         }
     };
 
-    parser.handleAwaPF2eActorUpdate ??= async function(actor, changed, options = {}) {
+    // Split out of handleAwaPF2eActorUpdate so the decision - including consuming the pending
+    // source and snapshotting HP - happens synchronously inside preUpdateActor. Returning null
+    // means "not ours": Achievements With Automation's own handler must still run.
+    parser.getAwaActorUpdatePlan ??= function(actor, changed, options = {}) {
         const api = this.getAchievementsApi();
-        if (!api) return false;
-        if (!this.isAchievementsTrackingEnabled()) return false;
+        if (!api) return null;
+        if (!this.isAchievementsTrackingEnabled()) return null;
 
         const damageDelta = Number(options.damageTaken);
-        if (damageDelta === 0 || damageDelta === undefined) return false;
-        if (!Number.isFinite(damageDelta)) return false;
-        if (options.damageUndo) return true;
+        if (!Number.isFinite(damageDelta) || damageDelta === 0) return null;
+        if (options.damageUndo) return { handled: true };
 
         const context = this.getAwaDamageSourceContext(actor);
         const sourceActor = context?.sourceActor;
-        if (!sourceActor?.getFlag) return true;
-        if (!canReceiveAwaCredit(sourceActor)) return true;
+        // We could not work out who dealt this. Falling through to AWA's own attribution (the
+        // active combatant) is imprecise, but silently dropping the achievement is worse - and it
+        // is what happened whenever the pending-source tracking missed, or libWrapper was absent
+        // and the applyDamage wrapper never got installed.
+        if (!sourceActor?.getFlag) return null;
+        // A resolved but ineligible source (an NPC, say) is still a deliberate suppression: AWA
+        // would otherwise hand the credit to whoever's turn it happens to be.
+        if (!canReceiveAwaCredit(sourceActor)) return { handled: true };
 
-        await this.applyAwaDamageHealingStats(api, sourceActor, actor, damageDelta, changed);
+        return {
+            handled: true,
+            api,
+            sourceActor,
+            damageDelta,
+            hitPoints: {
+                previousHp: Number(actor?.system?.attributes?.hp?.value),
+                currentHp: this.getAwaUpdatedHpValue(actor, changed)
+            }
+        };
+    };
 
+    parser.runAwaActorUpdatePlan ??= function(plan, actor) {
+        if (!plan?.api) return;
+        void this.applyAwaDamageHealingStats(plan.api, plan.sourceActor, actor, plan.damageDelta, plan.hitPoints)
+            .catch(error => console.warn("Yulong Homebrew | Failed to apply damage achievements.", error));
+    };
+
+    parser.handleAwaPF2eActorUpdate ??= async function(actor, changed, options = {}) {
+        const plan = this.getAwaActorUpdatePlan(actor, changed, options);
+        if (!plan) return false;
+        if (plan.api) {
+            await this.applyAwaDamageHealingStats(plan.api, plan.sourceActor, actor, plan.damageDelta, plan.hitPoints);
+        }
         return true;
     };
 
-    parser.handleAwaToolbeltActorUpdate ??= async function(actor, options) {
-        return this.handleAwaPF2eActorUpdate(actor, {}, options || {});
-    };
-
+    // Identified by source text because Foundry's hook registry does not record which module
+    // registered a handler. `updateQueue` is the distinctive token and stays mandatory; the second
+    // marker may be either of the remaining two so a light refactor upstream does not break us.
+    // A miss is now reported instead of silently disabling the whole attribution fix.
     parser.isAwaActorUpdateHook ??= function(hook) {
         const fn = hook?.fn || hook;
-        if (typeof fn !== "function") return false;
-        const source = Function.prototype.toString.call(fn);
-        return source.includes("updateQueue.push") && source.includes("processQueue") && source.includes("trackingEnabled");
+        if (typeof fn !== "function" || fn.__yulongHomebrewWrapped) return false;
+
+        let source = "";
+        try {
+            source = Function.prototype.toString.call(fn);
+        } catch {
+            return false;
+        }
+        if (!source.includes("updateQueue")) return false;
+        return source.includes("processQueue") || source.includes("trackingEnabled");
     };
 
     parser.wrapAwaActorUpdateHook ??= function(hook) {
-        const original = hook?.fn || hook;
+        const original = hook?.fn;
         if (typeof original !== "function" || original.__yulongHomebrewWrapped) return false;
 
         const parser = this;
-        const wrapped = async function(actor, data, options, userId) {
-            if (await parser.handleAwaPF2eActorUpdate(actor, data || {}, options || {})) return;
-            return original.call(this, actor, data, options, userId);
+        // Deliberately not async: the original handler must be reached in the same tick that
+        // preUpdateActor fires, so AWA still queues the update against the pre-update actor state.
+        const wrapped = function(actor, data, options, userId) {
+            let plan = null;
+            try {
+                plan = parser.getAwaActorUpdatePlan(actor, data || {}, options || {});
+            } catch (error) {
+                console.warn("Yulong Homebrew | Failed to resolve the achievement damage source.", error);
+            }
+            if (!plan) return original.call(this, actor, data, options, userId);
+            parser.runAwaActorUpdatePlan(plan, actor);
+            return undefined;
         };
         wrapped.__yulongHomebrewWrapped = true;
 
-        if (hook?.fn) hook.fn = wrapped;
+        hook.fn = wrapped;
         return true;
     };
 
     parser.installAchievementsCompat ??= function() {
-        if (!game.modules.get("achievements-with-automation")?.active) return;
+        if (!game.modules.get(AWA_MODULE_ID)?.active) return;
         if (this.__achievementsCompatInstalled) return;
 
         const actorHooks = Hooks.events?.preUpdateActor || Hooks._hooks?.preUpdateActor || [];
         const awaHook = actorHooks.find(hook => this.isAwaActorUpdateHook(hook));
-        if (!awaHook) return;
+        if (!awaHook) {
+            console.warn("Yulong Homebrew | Could not find the Achievements With Automation preUpdateActor handler; damage attribution will fall back to its default (the active combatant).");
+            return;
+        }
 
         this.__achievementsCompatInstalled = this.wrapAwaActorUpdateHook(awaHook);
+        if (!this.__achievementsCompatInstalled) {
+            console.warn("Yulong Homebrew | Found the Achievements With Automation preUpdateActor handler but could not wrap it.");
+        }
     };
 
+    // Runs only on the client that actually applied the damage: its caller needs a matching
+    // recent HP change, which preUpdateActor only records there. Requiring the primary GM on top
+    // of that made the two conditions mutually exclusive whenever a player applied the damage, so
+    // this branch never fired for them. The dedupe below is what keeps it single-shot.
     parser.applyAchievementsForToolbeltApplication ??= async function(message, data, entry, syntheticMessage) {
         const api = this.getAchievementsApi();
         if (!api) return;
         if (!this.isAchievementsTrackingEnabled()) return;
-        if (!this.isYulongPrimaryGM()) return;
 
         const achievementKey = this.getToolbeltApplicationKey(message.id, entry.targetId, entry.rollIndex);
         const achievementLooseKey = this.getToolbeltApplicationLooseKey(message.id, entry.rollIndex);
@@ -2984,7 +3442,7 @@ function installToolbeltCompat() {
         const amount = Number(appliedDamage.amount ?? appliedDamage.damage ?? 0);
         if (!Number.isFinite(amount) || amount <= 0) return;
 
-        this.processedAchievementApplications.add(achievementKey);
+        this.rememberYulongKey(this.processedAchievementApplications, achievementKey);
 
         if (appliedDamage.isHealing) {
             if (api.triggerProgressAchievements) await api.triggerProgressAchievements("healing_progressable", sourceActor, amount);
@@ -3004,20 +3462,34 @@ function installToolbeltCompat() {
         }
     };
 
+    // ChatMessage#user was removed in Foundry V13; the author is now a DocumentAuthorField.
     parser.getAwaMessageUser ??= function(message) {
-        const userId = message?.user?.id || message?.user;
-        return userId ? game.users.get(userId) : null;
+        const author = message?.author;
+        if (author && typeof author === "object") return author;
+        const userId = author ?? message?.user?.id ?? message?.user;
+        return typeof userId === "string" ? game.users.get(userId) : null;
     };
 
-    parser.shouldHandleAwaPF2eChatAsGM ??= function(message) {
-        const author = this.getAwaMessageUser(message);
-        const isSecret = (message?.whisper && message.whisper.length > 0) || message?.blind;
-        return Boolean(this.isYulongPrimaryGM() && (author?.isGM || isSecret));
+    // Achievements With Automation's own createChatMessage handlers bail on `game.user.isGM` and
+    // require `actor.isOwner`, so they run on any connected non-GM owner's client. Foundry
+    // broadcasts chat messages to every client (whisper only affects rendering), so whether the
+    // message was whispered does not change this - only whether such a client is connected.
+    parser.hasAwaNativeOwnerHandler ??= function(actor) {
+        if (typeof actor?.testUserPermission !== "function") return false;
+        const users = game.users?.contents ?? game.users ?? [];
+        for (const user of users) {
+            if (user.isGM || !user.active) continue;
+            if (actor.testUserPermission(user, "OWNER")) return true;
+        }
+        return false;
     };
 
-    parser.shouldHandleAwaPF2eChatAsOwner ??= function(message, actor) {
-        const author = this.getAwaMessageUser(message);
-        return Boolean(!game.user?.isGM && !author?.isGM && actor?.isOwner);
+    // Our supplements always run on exactly one client, the primary GM, and only for the cases
+    // Achievements With Automation will not cover itself. `nativeHandles` says whether AWA's
+    // native path applies to this kind of message at all.
+    parser.shouldHandleAwaPF2eChat ??= function(actor, nativeHandles) {
+        if (!this.isYulongPrimaryGM()) return false;
+        return !nativeHandles || !this.hasAwaNativeOwnerHandler(actor);
     };
 
     parser.getAwaPF2eChatActor ??= function(message) {
@@ -3032,7 +3504,7 @@ function installToolbeltCompat() {
     parser.markAwaPF2eChatProcessed ??= function(message, scope) {
         const key = this.getAwaPF2eChatKey(message, scope);
         if (this.processedAwaPF2eChatMessages.has(key)) return false;
-        this.processedAwaPF2eChatMessages.add(key);
+        this.rememberYulongKey(this.processedAwaPF2eChatMessages, key);
         return true;
     };
 
@@ -3046,10 +3518,8 @@ function installToolbeltCompat() {
     };
 
     parser.applyAwaPF2eThrowAchievements ??= async function(message) {
-        if (!this.shouldHandleAwaPF2eChatAsGM(message)) return false;
         const api = this.getAchievementsApi();
         if (!api || !this.isAchievementsTrackingEnabled()) return false;
-        if (!this.markAwaPF2eChatProcessed(message, "throw")) return false;
 
         const context = message.flags?.pf2e?.context || {};
         const type = context.type;
@@ -3064,6 +3534,12 @@ function installToolbeltCompat() {
 
         const actor = this.getAwaPF2eChatActor(message);
         if (!actor) return false;
+
+        // AWA's checkThrowPF only looks at these three context types, so spell attack rolls and
+        // perception checks are ours to cover regardless of who else is connected.
+        const nativeHandles = AWA_NATIVE_PF2E_THROW_TYPES.has(type);
+        if (!this.shouldHandleAwaPF2eChat(actor, nativeHandles)) return false;
+        if (!this.markAwaPF2eChatProcessed(message, "throw")) return false;
 
         const d20Results = getPF2eMessageD20Results(message);
         if (!d20Results.length) return false;
@@ -3097,6 +3573,17 @@ function installToolbeltCompat() {
         return true;
     };
 
+    parser.awaNativeHandlesConsumable ??= function(message, actor) {
+        return this.nativeAwaCanDetectHealingConsumable(message) && this.hasAwaNativeOwnerHandler(actor);
+    };
+
+    // AWA's checkItemUsedPF returns early whenever the message carries a pf2e context type, so
+    // context-bearing item cards are always ours.
+    parser.awaNativeHandlesItemUse ??= function(message, actor) {
+        const hasContext = Boolean(message?.flags?.pf2e?.context?.type);
+        return !hasContext && this.hasAwaNativeOwnerHandler(actor);
+    };
+
     parser.applyAwaPF2eItemAchievements ??= async function(message) {
         const api = this.getAchievementsApi();
         if (!api || !this.isAchievementsTrackingEnabled()) return false;
@@ -3104,29 +3591,26 @@ function installToolbeltCompat() {
         const actor = this.getAwaPF2eChatActor(message);
         if (!actor) return false;
 
-        const handleAsGM = this.shouldHandleAwaPF2eChatAsGM(message);
-        const handleAsOwner = this.shouldHandleAwaPF2eChatAsOwner(message, actor);
-        if (!handleAsGM && !handleAsOwner) return false;
+        const handleConsumable = this.shouldHandleAwaPF2eChat(actor, this.awaNativeHandlesConsumable(message, actor));
+        const handleItemUse = this.shouldHandleAwaPF2eChat(actor, this.awaNativeHandlesItemUse(message, actor));
+        if (!handleConsumable && !handleItemUse) return false;
 
         const item = await resolvePF2eMessageItem(message);
         if (!item) return false;
 
         const achievements = api.getAchievements?.() || [];
         let handled = false;
-        const hasContext = Boolean(message.flags?.pf2e?.context?.type);
-        const healingConsumable = isPF2eHealingConsumableMessage(message, item);
-        const nativeCanDetectConsumable = this.nativeAwaCanDetectHealingConsumable(message);
 
-        if (healingConsumable && (handleAsGM || !nativeCanDetectConsumable)) {
-            if (this.markAwaPF2eChatProcessed(message, "consumable")) {
-                for (const achievement of achievements.filter(achievement => achievement.automationHookId === "consumables")) {
-                    await advanceAwaCounterAchievement(api, actor, achievement, 1);
-                    handled = true;
-                }
+        if (handleConsumable
+            && isPF2eHealingConsumableMessage(message, item)
+            && this.markAwaPF2eChatProcessed(message, "consumable")) {
+            for (const achievement of achievements.filter(achievement => achievement.automationHookId === "consumables")) {
+                await advanceAwaCounterAchievement(api, actor, achievement, 1);
+                handled = true;
             }
         }
 
-        if ((handleAsGM || hasContext) && this.markAwaPF2eChatProcessed(message, "item-used")) {
+        if (handleItemUse && this.markAwaPF2eChatProcessed(message, "item-used")) {
             const itemName = String(item.name || "").toLowerCase();
             for (const achievement of achievements.filter(achievement => achievement.automationHookId === "item_used_name")) {
                 const filter = String(achievement.itemFilter || "").trim().toLowerCase();
@@ -3154,7 +3638,14 @@ function installToolbeltCompat() {
         if (!targetActor) return null;
 
         const save = typeof entry.save === "object" && entry.save !== null ? entry.save : {};
-        const isReroll = Boolean(save.rerolled || save.isReroll);
+        // Target Helper records the reroll kind ("hero" | "mythic" | "new" | "lower" | "higher").
+        // Holodeck treats context.isReroll as a hero point spend, so only forward it for the one
+        // kind that actually is one; the rest still count as rerolls for our own dedupe.
+        const rerollType = typeof save.rerolled === "string"
+            ? save.rerolled
+            : (save.rerolled || save.isReroll ? "new" : null);
+        const isReroll = Boolean(rerollType);
+        const isHeroPointReroll = rerollType === "hero";
         const targetName = this.getHolodeckResolvedActorName(targetActor, targetDoc.name || targetActor.name);
         if (!isReroll && this.hasRecentHolodeckSaveLog(targetName, entry.outcome)) return null;
 
@@ -3172,7 +3663,7 @@ function installToolbeltCompat() {
             target: { actor: targetActor.uuid, token: targetDoc.uuid || targetActor.uuid },
             outcome: entry.outcome,
             unadjustedOutcome: this.normalizePF2eOutcome(save.unadjustedOutcome) || entry.outcome,
-            isReroll,
+            isReroll: isHeroPointReroll,
             options: contextOptions
         }, { inplace: false });
         if (statistic) context.statistic = statistic;
@@ -3197,6 +3688,7 @@ function installToolbeltCompat() {
             flags,
             toolbeltCompat: {
                 saveKey: this.getToolbeltSaveKey(message.id, entry),
+                rerollType,
                 targetActor
             },
             isDamageRoll: false
@@ -3212,12 +3704,12 @@ function installToolbeltCompat() {
 
         for (const entry of entries) {
             const key = this.getToolbeltSaveKey(message.id, entry);
-            if (this.processedToolbeltSaveEntries.has(key)) continue;
+            if (this.hasProcessedToolbeltSaveEntry(key)) continue;
 
             const syntheticMessage = this.buildToolbeltSaveMessage(message, data, entry);
             if (!syntheticMessage) continue;
 
-            this.processedToolbeltSaveEntries.add(key);
+            this.rememberYulongKey(this.processedToolbeltSaveEntries, key);
             this.parseMessage(syntheticMessage);
             parsed = true;
         }
@@ -3242,6 +3734,8 @@ function installToolbeltCompat() {
         const systemKey = message.flags?.sf2e ? "sf2e" : "pf2e";
         const systemFlags = foundry.utils.deepClone(message.flags?.[systemKey] || {});
         const originUuid = systemFlags.origin?.uuid || data.author || data.item || message.item?.uuid || message.actor?.uuid;
+        const sourceActor = this.getToolbeltSourceActor(message, data);
+        const sourceIdentity = this.getHolodeckSourceIdentity(message, sourceActor);
 
         systemFlags.context = foundry.utils.mergeObject(systemFlags.context || {}, {
             type: "damage-taken",
@@ -3266,7 +3760,7 @@ function installToolbeltCompat() {
         const targetActor = appliedChange.targetActor || targetDoc.actor || (targetDoc.system ? targetDoc : null);
 
         return {
-            id: `${message.id}-toolbelt-${entry.targetId}-${entry.rollIndex}`,
+            id: this.getToolbeltApplicationMessageId(message.id, entry),
             actor: targetActor || message.actor,
             speaker: foundry.utils.mergeObject(message.speaker || {}, { alias: targetDoc.name || message.speaker?.alias }, { inplace: false }),
             alias: targetDoc.name || message.alias,
@@ -3276,8 +3770,12 @@ function installToolbeltCompat() {
             content: `${message.content || ""} <span>${applicationText} ${amount}</span>`,
             flags,
             toolbeltCompat: {
-                targetActor
+                targetActor,
+                sourceIdentity: this.serializeHolodeckSourceIdentity(sourceIdentity)
             },
+            // These HP values come straight out of the preUpdateActor record, so kill
+            // normalisation may act on them in both directions.
+            yulongHpSnapshotTrusted: true,
             isDamageRoll: false
         };
     };
@@ -3287,6 +3785,10 @@ function installToolbeltCompat() {
         const data = this.getToolbeltData(message);
         if (!data?.applied) return false;
 
+        // Target Helper rewrites its whole flag on every change, so `changed` lists every
+        // application ever made on this message, not just the new one. What actually keeps this
+        // single-shot is hasProcessedToolbeltApplication plus buildToolbeltApplicationMessage
+        // requiring a matching recent HP change.
         const pending = this.getPendingToolbeltApplication(message.id);
         const changedEntries = this.getChangedToolbeltApplicationEntries(changed);
         const entries = changedEntries.length > 0 ? changedEntries : this.getToolbeltApplicationEntries(data);
@@ -3297,16 +3799,18 @@ function installToolbeltCompat() {
         let parsed = false;
         for (const entry of candidateEntries) {
             const key = this.getToolbeltApplicationKey(message.id, entry.targetId, entry.rollIndex);
-            if (this.processedToolbeltApplications.has(key)) continue;
+            const holodeckHandled = this.hasProcessedToolbeltApplication(message, entry);
 
             const syntheticMessage = this.buildToolbeltApplicationMessage(message, data, entry);
             if (!syntheticMessage) continue;
 
-            this.processedToolbeltApplications.add(key);
-            this.parseMessage(syntheticMessage);
+            if (!holodeckHandled) {
+                this.rememberYulongKey(this.processedToolbeltApplications, key);
+                this.parseMessage(syntheticMessage);
+                parsed = true;
+            }
             void this.applyAchievementsForToolbeltApplication(message, data, entry, syntheticMessage)
                 .catch(error => console.warn("Yulong Homebrew | Failed to forward Toolbelt application to Achievements With Automation.", error));
-            parsed = true;
         }
         if (parsed && pending) this.clearPendingToolbeltApplication(pending);
         return parsed;
@@ -3315,57 +3819,61 @@ function installToolbeltCompat() {
     parser.installHolodeckParserWrapper();
     parser.installYulongPrimaryGMSaveGuard();
 
-    if (!parser.hasHookHandlerContaining("createChatMessage", "handleSecretHolodeckDamageMessage")) {
-        Hooks.on("createChatMessage", message => {
-            parser.handleSecretHolodeckDamageMessage(message);
-        });
+    // The registry lives on window.yulongHomebrew rather than on the parser so it survives the
+    // CombatParser object being replaced. It used to work by searching registered handlers for
+    // one of our identifiers, which would silently re-register every hook (doubling all stats)
+    // the moment this file was bundled or minified.
+    const registeredHooks = window.yulongHomebrew.registeredHooks ??= {};
+    const registerHookOnce = (event, id, callback) => {
+        const key = `${event}:${id}`;
+        if (registeredHooks[key] !== undefined) return;
+        registeredHooks[key] = Hooks.on(event, callback);
+    };
+
+    registerHookOnce("createChatMessage", "secretHolodeckDamage", message => {
+        parser.handleSecretHolodeckDamageMessage(message);
+    });
+
+    registerHookOnce("createChatMessage", "awaPF2eChat", message => {
+        void parser.handleAwaPF2eChatMessage(message)
+            .catch(error => console.warn("Yulong Homebrew | Failed to apply PF2e chat achievement compatibility.", error));
+    });
+
+    registerHookOnce("updateChatMessage", "toolbeltApplications", async (message, changed) => {
+        if (!message || !message.id) return;
+        const isSecret = (message.whisper && message.whisper.length > 0) || message.blind;
+        const isHolodeck = canvas.scene?.getFlag("pf2e-holodeck", "active");
+        if (isSecret && !isHolodeck) return;
+
+        const parsedSaves = parser.parseToolbeltSaveVariants(message, changed);
+        const parsedApplications = await parser.parseToolbeltApplications(message, changed);
+        const parsed = parsedSaves || parsedApplications;
+        if (!parsed) return;
+
+        if (window.combatForensicsInstance?.rendered) window.combatForensicsInstance.render();
+    });
+
+    registerHookOnce("updateChatMessage", "revertedHolodeckDamage", (message, changed) => {
+        parser.handleRevertedHolodeckDamageMessage(message, changed);
+    });
+
+    registerHookOnce("preUpdateActor", "recordRecentHpChange", (actor, changed, options = {}) => {
+        if (!actor) return;
+        parser.recordRecentHpChange(actor, changed, options);
+    });
+
+    if (!window.yulongHomebrew.__yulongPendingSourceClickListenerInstalled) {
+        window.yulongHomebrew.__yulongPendingSourceClickListenerInstalled = true;
+        // Capture phase: Target Helper's own row handlers call stopPropagation, so a bubbling
+        // listener would never see the click.
+        document.body.addEventListener("click", event => {
+            parser.recordPendingAwaToolbeltSource(event);
+            parser.recordPendingAwaPF2eDamageSource(event);
+            parser.recordPendingHolodeckDamageSource(event);
+        }, true);
     }
-
-    if (!parser.hasHookHandlerContaining("createChatMessage", "handleAwaPF2eChatMessage")) {
-        Hooks.on("createChatMessage", message => {
-            void parser.handleAwaPF2eChatMessage(message)
-                .catch(error => console.warn("Yulong Homebrew | Failed to apply PF2e chat achievement compatibility.", error));
-        });
-    }
-
-    if (!parser.hasHookHandlerContaining("updateChatMessage", "parseToolbeltApplications")) {
-        Hooks.on("updateChatMessage", async (message, changed) => {
-            if (!message || !message.id) return;
-            const isSecret = (message.whisper && message.whisper.length > 0) || message.blind;
-            const isHolodeck = canvas.scene?.getFlag("pf2e-holodeck", "active");
-            if (isSecret && !isHolodeck) return;
-
-            const parsedSaves = parser.parseToolbeltSaveVariants(message, changed);
-            const parsedApplications = await parser.parseToolbeltApplications(message, changed);
-            const parsed = parsedSaves || parsedApplications;
-            if (!parsed) return;
-
-            if (window.combatForensicsInstance?.rendered) window.combatForensicsInstance.render();
-        });
-    }
-
-    if (!parser.hasHookHandlerContaining("updateChatMessage", "handleRevertedHolodeckDamageMessage")) {
-        Hooks.on("updateChatMessage", (message, changed) => {
-            parser.handleRevertedHolodeckDamageMessage(message, changed);
-        });
-    }
-
-    if (!parser.hasHookHandlerContaining("preUpdateActor", "recordRecentHpChange")) {
-        Hooks.on("preUpdateActor", (actor, changed, options = {}) => {
-            if (!actor) return;
-            parser.recordRecentHpChange(actor, changed, options);
-        });
-    }
-
-    document.body.addEventListener("click", event => {
-        parser.recordPendingAwaToolbeltSource(event);
-        parser.recordPendingAwaPF2eDamageSource(event);
-        parser.recordPendingHolodeckDamageSource(event);
-    }, true);
 
     parser.installAchievementsCompat();
-
-    console.log("Yulong Homebrew | PF2e Holodeck Toolbelt compatibility ready.");
 }
 
 Hooks.once("init", registerHomebrewSettings);
