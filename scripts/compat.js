@@ -6,15 +6,20 @@ import {
     setHolodeckKillMarker,
     summarizeHolodeckDamageRolls
 } from "./statistics.js";
+import { actorHistoryKeys, createDocumentQueue, isPrimaryItemUseMessage, matchesActorReference } from "./runtime-safety.js";
+
+const enqueueDamage = createDocumentQueue();
+const enqueueAchievement = createDocumentQueue();
+const healthDeltaScopes = new WeakMap();
+const pendingDamageSources = new Map();
+const processedAchievementRequests = new Set();
 
 const MODULE_ID = "yulong-homebrew";
 const PATREON_MODULE_ID = "patreon-v3";
 const FUMBLE_SWITCH_MODULE_ID = "fumble-switch";
-const PF2E_HUD_MODULE_ID = "pf2e-hud";
 const LOW_HP_INCAPACITATION_ENABLED = "lowHpIncapacitationEnabled";
 const LOW_HP_INCAPACITATION_PERCENT = "lowHpIncapacitationPercent";
 const FUMBLE_SWITCH_WIDGET_VISIBLE = "fumbleSwitchWidgetVisible";
-const PF2E_HUD_DISCRETE_HEALTH_COLORS = "pf2eHudDiscreteHealthColors";
 const TROOP_HOUSERULES_ENABLED = "troopHouseRulesEnabled";
 const TROOP_AREA_WEAKNESS_ADVISOR_ENABLED = "troopAreaWeaknessAdvisorEnabled";
 const PATREON_INCAPACITATION_LABEL = "PF2E.TraitIncapacitation";
@@ -35,10 +40,9 @@ function isAchievementsWithAutomationActive() {
 }
 
 function hasNonGMOwner(actor) {
-    return Object.keys(actor?.ownership || {}).some(ownerId => {
-        const user = game.users.get(ownerId);
-        return user && !user.isGM;
-    });
+    if (typeof actor?.testUserPermission !== "function") return false;
+    const users = game.users?.contents ?? game.users ?? [];
+    return Array.from(users).some(user => !user.isGM && actor.testUserPermission(user, "OWNER"));
 }
 
 function canReceiveAwaCredit(actor) {
@@ -74,20 +78,19 @@ function recordPendingAwaPF2eDamageSourceContext({ sourceActor, targetActor, tar
 
     window.yulongHomebrew ??= {};
     if (!sourceActor?.getFlag) {
-        const pending = window.yulongHomebrew.pendingAwaPF2eDamageSource;
-        if (isPersistentDamageItem(item) && pending && (
-            pending.targetActorId === targetActor.id
-            || pending.targetActorUuid === targetActor.uuid
-            || pending.targetUuid === targetActor.uuid
-        )) {
-            delete window.yulongHomebrew.pendingAwaPF2eDamageSource;
+        const pending = pendingDamageSources.get(targetActor.uuid);
+        if (isPersistentDamageItem(item) && matchesActorReference(pending, targetActor)) {
+            pendingDamageSources.delete(targetActor.uuid);
         }
         return;
     }
 
     const tokenUuid = targetUuid || getAwaTargetTokenUuid(targetToken);
     const applicationKey = `${reason}:${messageId || item?.uuid || sourceActor.uuid || sourceActor.id}:${targetActor.uuid || targetActor.id}:${Date.now()}`;
-    window.yulongHomebrew.pendingAwaPF2eDamageSource = {
+    for (const [key, pending] of pendingDamageSources) {
+        if (Date.now() - pending.timestamp > AWA_PF2E_PENDING_SOURCE_TIMEOUT_MS) pendingDamageSources.delete(key);
+    }
+    pendingDamageSources.set(targetActor.uuid, {
         applicationKey,
         applicationLooseKey: applicationKey,
         messageId,
@@ -101,15 +104,13 @@ function recordPendingAwaPF2eDamageSourceContext({ sourceActor, targetActor, tar
         itemUuid: item?.uuid || null,
         timestamp: Date.now(),
         reason
-    };
+    });
 }
 
-// Achievement progress lives in an actor flag. `api.grantAchievement` can hop to the GM over a
-// socket, but a raw setFlag cannot, so skip the write (and say so) when this client lacks
-// ownership rather than letting Foundry throw a permission error mid-hook.
+// All supplemental progress writes run in the primary GM's per-Actor queue.
 async function setAwaProgressFlag(actor, flag, value) {
     if (!flag || !actor?.setFlag) return false;
-    if (!actor.isOwner && !game.user?.isGM) {
+    if (!isPrimaryAchievementGM() || !actor.canUserModify?.(game.user, "update")) {
         console.warn(`Yulong Homebrew | Cannot record achievement progress on "${actor.name}" without ownership.`);
         return false;
     }
@@ -117,7 +118,88 @@ async function setAwaProgressFlag(actor, flag, value) {
     return true;
 }
 
-async function advanceAwaCounterAchievement(api, actor, achievement, amount = 1) {
+function advanceAwaCounterAchievement(api, actor, achievement, amount = 1) {
+    if (!canReceiveAwaCredit(actor)) return;
+    if (!isPrimaryAchievementGM()) return requestAchievementUpdate(actor, { kind: "counter", achievementId: achievement.id, amount });
+    return enqueueAchievement(actor, () => advanceAwaCounterAchievementNow(api, actor, achievement, amount));
+}
+
+function isPrimaryAchievementGM() {
+    return Boolean(game.user?.isGM && game.users.activeGM?.id === game.user.id);
+}
+
+function requestAchievementUpdate(actor, payload) {
+    const gm = game.users.activeGM;
+    if (!gm) {
+        console.warn("Yulong Homebrew | No active GM available for achievement progress.");
+        return;
+    }
+    game.socket.emit(`module.${MODULE_ID}`, {
+        ...payload, actorUuid: actor.uuid, requestId: foundry.utils.randomID()
+    }, { recipients: [gm.id] });
+}
+
+async function handleAchievementRequest(request, senderId) {
+    if (!isPrimaryAchievementGM() || !isAchievementsWithAutomationActive()) return;
+    if (!request || !["counter", "one-time"].includes(request.kind)) return;
+    if (typeof request.requestId !== "string" || request.requestId.length > 64) return;
+    if (!Number.isFinite(request.amount) || request.amount <= 0) return;
+    if (game.settings.get(AWA_MODULE_ID, "trackingEnabled") === false) return;
+    const sender = game.users.get(senderId);
+    const actor = fromUuidSyncSafe(request.actorUuid);
+    if (!sender || !canReceiveAwaCredit(actor) || !actor.canUserModify?.(game.user, "update")) return;
+    if (!sender.isGM && !actor.testUserPermission(sender, "OWNER")) return;
+    const key = `${senderId}:${request.requestId}`;
+    if (processedAchievementRequests.has(key)) return;
+    const api = window.AchievementsAPI;
+    const achievement = api?.getAchievements?.().find(entry => entry.id === request.achievementId);
+    if (!achievement) return;
+    const hook = achievement.automationHookId || "";
+    if (request.kind === "counter") {
+        if (request.amount !== 1 || !/^(monster_killed|attack_nat_|save_nat_|check_nat_|check_score|consumables$|item_used_name$)/.test(hook)) return;
+    } else if (!["damage_one_time", "healing_one_time"].includes(hook)) return;
+    processedAchievementRequests.add(key);
+    if (processedAchievementRequests.size > 2000) processedAchievementRequests.delete(processedAchievementRequests.values().next().value);
+    try {
+        await enqueueAchievement(actor, () => request.kind === "counter"
+            ? advanceAwaCounterAchievementNow(api, actor, achievement, request.amount)
+            : completeOneTimeAchievementNow(api, actor, achievement, request.amount));
+    } catch (error) {
+        processedAchievementRequests.delete(key);
+        throw error;
+    }
+}
+
+function installAchievementWriteQueue() {
+    if (!isAchievementsWithAutomationActive()) return;
+    window.yulongHomebrew ??= {};
+    if (window.yulongHomebrew.__yulongAchievementWriteQueueInstalled) return;
+    window.yulongHomebrew.__yulongAchievementWriteQueueInstalled = true;
+    // V14.367 handleCustomSocket appends the authenticated sender id as argument
+    // two. Never trust a user id supplied inside the request payload.
+    game.socket.on(`module.${MODULE_ID}`, (request, senderId) => {
+        void handleAchievementRequest(request, senderId)
+            .catch(error => console.warn("Yulong Homebrew | Failed to save achievement progress.", error));
+    });
+    if (typeof window.AchievementsAPI?.triggerProgressAchievements !== "function") return;
+    if (!game.modules.get("lib-wrapper")?.active || typeof libWrapper?.register !== "function") return;
+    // AWA 1.4.1 also dispatches player progress requests through this API on GMs.
+    libWrapper.register(MODULE_ID, "window.AchievementsAPI.triggerProgressAchievements", function(wrapped, hookId, actor, amount) {
+        if (!game.user.isGM) return wrapped(hookId, actor, amount);
+        if (!isPrimaryAchievementGM() || !canReceiveAwaCredit(actor) || !actor.canUserModify?.(game.user, "update")) return;
+        return enqueueAchievement(actor, () => wrapped(hookId, actor, amount));
+    }, "MIXED");
+}
+
+async function completeOneTimeAchievementNow(api, actor, achievement, amount) {
+    if (actor.getFlag(AWA_MODULE_ID, achievement.id) === undefined || actor.getFlag(AWA_MODULE_ID, achievement.id)) return;
+    if (amount < Number(achievement.target || 0)) return;
+    if (!await setAwaProgressFlag(actor, achievement.flag, Number(achievement.target || amount))) return;
+    await api.grantAchievement(achievement.id, actor);
+}
+
+async function advanceAwaCounterAchievementNow(api, actor, achievement, amount = 1) {
+    if (!isPrimaryAchievementGM() || !actor?.canUserModify?.(game.user, "update")) return;
     if (!actor?.getFlag || actor.getFlag(AWA_MODULE_ID, achievement.id) === undefined) return;
     const completed = actor.getFlag(AWA_MODULE_ID, achievement.id);
     if (completed) return;
@@ -134,7 +216,7 @@ async function advanceAwaCounterAchievement(api, actor, achievement, amount = 1)
     const flag = achievement.flag;
     const current = Number(actor.getFlag(AWA_MODULE_ID, flag) || 0) + amount;
     if (current >= target) {
-        await setAwaProgressFlag(actor, flag, target || current);
+        if (!await setAwaProgressFlag(actor, flag, target || current)) return;
         await api.grantAchievement(achievement.id, actor);
     } else {
         await setAwaProgressFlag(actor, flag, current);
@@ -251,16 +333,6 @@ function registerHomebrewSettings() {
         onChange: value => applyFumbleSwitchWidgetVisibility(value)
     });
 
-    game.settings.register(MODULE_ID, PF2E_HUD_DISCRETE_HEALTH_COLORS, {
-        name: "PF2e HUD discrete health colors",
-        hint: "Quantize PF2e HUD health colors to the configured health-status bands so players cannot infer exact HP from color gradients.",
-        scope: "world",
-        config: true,
-        type: Boolean,
-        default: true,
-        onChange: value => value ? applyPF2eHudDiscreteHealthColors() : restorePF2eHudDiscreteHealthColors()
-    });
-
     game.settings.register(MODULE_ID, TROOP_HOUSERULES_ENABLED, {
         name: "PF2e troop single-target damage cap",
         hint: "Caps single-target damage to troops at 1/20 of maximum HP after PF2e has applied immunities, weaknesses, resistances, shields, and hardness.",
@@ -320,19 +392,8 @@ function installPF2eCheckRollWrapper() {
         const applyLowHpIncapacitation = shouldApplyLowHpIncapacitation(context)
             && isLowHpIncapacitationTarget(context.actor);
 
-        if (applyLowHpIncapacitation) {
-            context.__yulongPatreonIncapacitationLabel = PATREON_INCAPACITATION_LABEL;
-            clearPatreonIncapacitationResult(context);
-        }
-
         if (!applyLowHpIncapacitation) return wrapped(...args);
-
-        const result = temporarilySuppressPatreonIncapacitationMode(() => wrapped(...args));
-        if (result && typeof result.finally === "function") {
-            return result.finally(() => clearPatreonIncapacitationResult(context));
-        }
-        clearPatreonIncapacitationResult(context);
-        return result;
+        return rollWithoutPatreonIncapacitation(context, scoped => wrapped(args[0], scoped, ...args.slice(2)));
     };
 
     wrappedRoll.__yulongPF2eCheckRollWrapperInstalled = true;
@@ -525,53 +586,6 @@ function shouldCapTroopSingleTargetDamage(actor, { damage, final, rollOptions, i
     return getTroopSingleTargetDamageCap(actor) !== null;
 }
 
-// PF2e calls `this.calculateHealthDelta` from inside applyDamage, so the only interception point
-// is the actor instance itself. Two things matter here: restoring must remove the own property
-// again (assigning the prototype method back leaves a permanent shadow), and overlapping
-// applications on the same actor must not restore out of order, hence the identity check.
-function withPatchedCalculateHealthDelta(actor, patch, callback) {
-    const original = actor?.calculateHealthDelta;
-    if (typeof original !== "function") return callback();
-
-    const hadOwnProperty = Object.prototype.hasOwnProperty.call(actor, "calculateHealthDelta");
-    const previousOwnValue = hadOwnProperty ? original : undefined;
-    const patched = function(args) {
-        return patch.call(this, original, args);
-    };
-    actor.calculateHealthDelta = patched;
-
-    const restore = () => {
-        if (actor.calculateHealthDelta !== patched) return;
-        if (hadOwnProperty) actor.calculateHealthDelta = previousOwnValue;
-        else delete actor.calculateHealthDelta;
-    };
-
-    try {
-        const result = callback();
-        if (result && typeof result.finally === "function") return result.finally(restore);
-        restore();
-        return result;
-    } catch (error) {
-        restore();
-        throw error;
-    }
-}
-
-function withTroopDamageCap(actor, cap, breakdown, callback) {
-    let capApplied = false;
-    return withPatchedCalculateHealthDelta(actor, function(original, args) {
-        const delta = Number(args?.delta);
-        if (Number.isFinite(delta) && delta > cap) {
-            if (!capApplied) {
-                capApplied = true;
-                breakdown?.push?.(`Single-target troop damage cap: ${cap}`);
-            }
-            return original.call(this, { ...args, delta: cap });
-        }
-        return original.call(this, args);
-    }, callback);
-}
-
 function escapeYulongHTML(value) {
     const element = document.createElement("div");
     element.innerText = String(value ?? "");
@@ -640,42 +654,6 @@ async function createTroopAreaWeaknessAdvisorMessage(data) {
     });
 }
 
-function withTroopAreaWeaknessAdvisor(actor, context, callback) {
-    let capturedDamage = null;
-    const maybeCreateAdvisor = () => {
-        if (!capturedDamage) return;
-        const data = {
-            ...context,
-            damage: capturedDamage.delta,
-            totalApplied: Number.isFinite(capturedDamage.totalApplied) ? capturedDamage.totalApplied : capturedDamage.delta
-        };
-        void createTroopAreaWeaknessAdvisorMessage(data)
-            .catch(error => console.warn("Yulong Homebrew | Failed to create troop area weakness advisor card.", error));
-    };
-
-    return withPatchedCalculateHealthDelta(actor, function(original, args) {
-        const delta = Number(args?.delta);
-        const result = original.call(this, args);
-        if (Number.isFinite(delta) && delta > 0) {
-            capturedDamage = {
-                delta,
-                totalApplied: Number(result?.totalApplied)
-            };
-        }
-        return result;
-    }, () => {
-        const result = callback();
-        if (result && typeof result.then === "function") {
-            return result.then(value => {
-                maybeCreateAdvisor();
-                return value;
-            });
-        }
-        maybeCreateAdvisor();
-        return result;
-    });
-}
-
 function fromUuidSyncSafe(uuid) {
     if (!uuid) return null;
     try {
@@ -687,7 +665,7 @@ function fromUuidSyncSafe(uuid) {
 
 function getTroopAreaWeaknessTarget(data) {
     const tokenDocument = fromUuidSyncSafe(data.tokenUuid);
-    const actor = tokenDocument?.actor || fromUuidSyncSafe(data.actorUuid) || game.actors.get(data.actorId);
+    const actor = tokenDocument?.actor || (data.actorUuid ? fromUuidSyncSafe(data.actorUuid) : game.actors.get(data.actorId));
     const activeToken = actor?.getActiveTokens?.(true, true)?.[0] || null;
     const token = tokenDocument?.object || tokenDocument || activeToken?.document || activeToken || null;
     return { actor, token };
@@ -698,8 +676,7 @@ function getTroopAreaWeaknessSourceItem(data) {
 }
 
 function getTroopAreaWeaknessSourceActor(data, item = null) {
-    return fromUuidSyncSafe(data.sourceActorUuid)
-        || game.actors.get(data.sourceActorId)
+    return (data.sourceActorUuid ? fromUuidSyncSafe(data.sourceActorUuid) : game.actors.get(data.sourceActorId))
         || getSourceActorFromItem(item);
 }
 
@@ -845,7 +822,8 @@ function installTroopAreaWeaknessAdvisorChatHandler() {
 
 function installTroopDamageHouseRules() {
     const actorClass = CONFIG?.Actor?.documentClass;
-    if (!actorClass?.prototype || typeof actorClass.prototype.applyDamage !== "function") return;
+    if (!actorClass?.prototype || typeof actorClass.prototype.applyDamage !== "function"
+        || typeof actorClass.prototype.calculateHealthDelta !== "function") return;
     window.yulongHomebrew ??= {};
     if (window.yulongHomebrew.__yulongTroopDamageHouseRulesInstalled) return;
     if (!game.modules.get("lib-wrapper")?.active || typeof libWrapper?.register !== "function") {
@@ -853,25 +831,51 @@ function installTroopDamageHouseRules() {
         return;
     }
 
-    const wrappedApplyDamage = function(wrapped, params = {}) {
-        const breakdown = Array.isArray(params.breakdown) ? params.breakdown : [];
-        recordPendingAwaPF2eDamageSourceContext({
-            sourceActor: getAwaSourceActorFromDamageItem(params.item),
-            targetActor: this,
-            targetToken: params.token,
-            item: params.item,
-            reason: "pf2e-apply-damage"
+    // PF2e 8.4.1 applyDamage awaits before its one synchronous health-delta
+    // calculation. Serialize the entire application, not just the calculation.
+    libWrapper.register(MODULE_ID, "CONFIG.Actor.documentClass.prototype.calculateHealthDelta", function(wrapped, args) {
+        const scope = healthDeltaScopes.get(this);
+        healthDeltaScopes.delete(this);
+        let delta = Number(args?.delta);
+        if (scope?.cap && Number.isFinite(delta) && delta > scope.cap) {
+            delta = scope.cap;
+            scope.breakdown.push(`Single-target troop damage cap: ${delta}`);
+            args = { ...args, delta };
+        }
+        const result = wrapped(args);
+        if (scope?.advisor && Number.isFinite(delta) && delta > 0) {
+            scope.captured = { delta, totalApplied: Number(result?.totalApplied) };
+        }
+        return result;
+    }, "WRAPPER");
+
+    libWrapper.register(MODULE_ID, "CONFIG.Actor.documentClass.prototype.applyDamage", function(wrapped, params = {}) {
+        return enqueueDamage(this, async () => {
+            const breakdown = Array.isArray(params.breakdown) ? [...params.breakdown] : [];
+            recordPendingAwaPF2eDamageSourceContext({
+                sourceActor: getAwaSourceActorFromDamageItem(params.item),
+                targetActor: this, targetToken: params.token, item: params.item,
+                reason: "pf2e-apply-damage"
+            });
+            const cap = shouldCapTroopSingleTargetDamage(this, params) ? getTroopSingleTargetDamageCap(this) : null;
+            const scope = { cap, breakdown, advisor: cap ? null : getTroopAreaWeaknessAdvisorContext(this, params) };
+            healthDeltaScopes.set(this, scope);
+            try {
+                const result = await wrapped({ ...params, breakdown });
+                if (scope.advisor && scope.captured) {
+                    const { delta, totalApplied } = scope.captured;
+                    void createTroopAreaWeaknessAdvisorMessage({
+                        ...scope.advisor, damage: delta,
+                        totalApplied: Number.isFinite(totalApplied) ? totalApplied : delta
+                    }).catch(error => console.warn("Yulong Homebrew | Failed to create troop area weakness advisor card.", error));
+                }
+                return result;
+            } finally {
+                healthDeltaScopes.delete(this);
+                pendingDamageSources.delete(this.uuid);
+            }
         });
-        const cap = shouldCapTroopSingleTargetDamage(this, params) ? getTroopSingleTargetDamageCap(this) : null;
-        const areaWeaknessContext = cap ? null : getTroopAreaWeaknessAdvisorContext(this, params);
-        const applyDamage = () => wrapped.call(this, { ...params, breakdown });
-
-        if (cap) return withTroopDamageCap(this, cap, breakdown, applyDamage);
-        if (areaWeaknessContext) return withTroopAreaWeaknessAdvisor(this, areaWeaknessContext, applyDamage);
-        return applyDamage();
-    };
-
-    libWrapper.register(MODULE_ID, "CONFIG.Actor.documentClass.prototype.applyDamage", wrappedApplyDamage, "WRAPPER");
+    }, "WRAPPER");
     installTroopAreaWeaknessAdvisorChatHandler();
     window.yulongHomebrew.__yulongTroopDamageHouseRulesInstalled = true;
 
@@ -918,51 +922,24 @@ function removeIncapacitationAdjustment(context) {
     return context.dosAdjustments.length !== originalLength;
 }
 
-function clearPatreonIncapacitationResult(context) {
-    const removedAdjustment = removeIncapacitationAdjustment(context);
-    if (removedAdjustment && context.rollTwice === "keep-higher") delete context.rollTwice;
-}
-
-// patreon-v3 reads its incapacitation mode straight from settings during a check roll, so the
-// only way to opt a single roll out is to intercept the read. Swapping game.settings.get in and
-// out around each roll is not re-entrant: an overlapping roll captures the already-patched
-// function as its "original" and restoring out of order strands the patch forever. Instead the
-// interceptor is installed once and stays inert until a suppression scope raises the depth.
-let patreonIncapacitationSuppressionDepth = 0;
-let patreonIncapacitationSettingsGet = null;
-
-function installPatreonIncapacitationSettingsInterceptor() {
-    if (patreonIncapacitationSettingsGet && game.settings.get === patreonIncapacitationSettingsGet) return;
-
-    const previousGet = game.settings.get.bind(game.settings);
-    patreonIncapacitationSettingsGet = function(namespace, key, ...args) {
-        if (patreonIncapacitationSuppressionDepth > 0
-            && namespace === PATREON_MODULE_ID
-            && key === "incapacitation") return "no";
-        return previousGet(namespace, key, ...args);
-    };
-    game.settings.get = patreonIncapacitationSettingsGet;
-}
-
-function temporarilySuppressPatreonIncapacitationMode(callback) {
-    installPatreonIncapacitationSettingsInterceptor();
-    patreonIncapacitationSuppressionDepth += 1;
-
-    let released = false;
-    const release = () => {
-        if (released) return;
-        released = true;
-        patreonIncapacitationSuppressionDepth = Math.max(0, patreonIncapacitationSuppressionDepth - 1);
-    };
-
+// Verified against patreon-v3 3.2.26: its Check.roll prelude synchronously
+// assigns rollTwice and pushes an incapacitation adjustment. PF2e 8.4.1
+// awaits Roll.evaluate before reading dosAdjustments. Scope these changes to
+// this context only; never intercept game.settings or alter roll options.
+function rollWithoutPatreonIncapacitation(context, callback) {
+    removeIncapacitationAdjustment(context);
+    let preparing = true;
+    const scoped = new Proxy(context, {
+        set(target, key, value) {
+            if (preparing && key === "rollTwice" && value === "keep-higher") return true;
+            return Reflect.set(target, key, value);
+        }
+    });
     try {
-        const result = callback();
-        if (result && typeof result.finally === "function") return result.finally(release);
-        release();
-        return result;
-    } catch (error) {
-        release();
-        throw error;
+        return callback(scoped);
+    } finally {
+        preparing = false;
+        removeIncapacitationAdjustment(context);
     }
 }
 
@@ -1048,234 +1025,6 @@ function installFumbleSwitchWidgetCompat() {
     window.yulongHomebrew.fumbleSwitchWidgetObserver = observer;
 
     console.log("Yulong Homebrew | Fumble Switch floating widget compatibility ready.");
-}
-
-function clampNumber(value, min, max) {
-    const number = Number(value);
-    if (!Number.isFinite(number)) return min;
-    return Math.min(Math.max(number, min), max);
-}
-
-function getPF2eHudDefaultHealthLabels() {
-    const path = `${PF2E_HUD_MODULE_ID}.health-status.default`;
-    const fallback = "Dead, At Death's Door, Not Feeling Good, Seen Better Days, Barely Hurt, Perfectly Fine";
-    const localized = game.i18n?.has?.(path, true) ? game.i18n.localize(path) : fallback;
-    return localized.split(",").map(label => label.trim());
-}
-
-function getPF2eHudDefaultHealthEntry(index) {
-    const labels = getPF2eHudDefaultHealthLabels();
-    return labels.at(index)?.trim() ?? "";
-}
-
-function getPF2eHudDefaultHealthStatusEntries() {
-    const labels = getPF2eHudDefaultHealthLabels();
-    const nbEntries = labels.length - 1;
-    if (nbEntries < 1) return [];
-
-    const segment = 100 / (nbEntries - 1);
-    const entries = [];
-    for (let i = 1; i < nbEntries; i++) {
-        entries.push({
-            label: labels[i].trim(),
-            marker: Math.max(Math.floor((i - 1) * segment), 1)
-        });
-    }
-    return entries;
-}
-
-function normalizePF2eHudHealthStatus(source = {}) {
-    const status = {
-        dead: typeof source.dead === "string" ? source.dead : getPF2eHudDefaultHealthEntry(0),
-        enabled: typeof source.enabled === "boolean" ? source.enabled : true,
-        full: typeof source.full === "string" ? source.full : getPF2eHudDefaultHealthEntry(-1),
-        entries: Array.isArray(source.entries) ? source.entries : getPF2eHudDefaultHealthStatusEntries()
-    };
-
-    const entries = status.entries
-        .filter(entry => typeof entry?.label === "string" && Number.isFinite(Number(entry.marker)))
-        .map(entry => ({
-            label: entry.label,
-            marker: Math.trunc(clampNumber(entry.marker, 1, 99))
-        }))
-        .sort((a, b) => a.marker - b.marker);
-
-    for (let i = entries.length - 1; i >= 0; i--) {
-        const previous = entries[i - 1]?.marker ?? 0;
-        const next = entries[i + 1]?.marker ?? 100;
-
-        if (entries[i].marker <= previous) entries[i].marker = previous + 1;
-        if (entries[i].marker >= next) entries.splice(i, 1);
-    }
-
-    if (entries.length === 0) entries.push({ label: "???", marker: 50 });
-    status.entries = entries;
-    return status;
-}
-
-function getPF2eHudHealthStatus() {
-    try {
-        return normalizePF2eHudHealthStatus(game.settings.get(PF2E_HUD_MODULE_ID, "healthStatusData") || {});
-    } catch {
-        return normalizePF2eHudHealthStatus();
-    }
-}
-
-function pf2eHudHueFromPercent(percent) {
-    const ratio = clampNumber(percent, 0, 100) / 100;
-    return ratio * ratio * 122 + 3;
-}
-
-function getPF2eHudHealthBands(status = getPF2eHudHealthStatus()) {
-    const bands = [
-        { label: status.dead, marker: 0, next: 1, hue: pf2eHudHueFromPercent(0) }
-    ];
-
-    status.entries.forEach((entry, index) => {
-        const next = status.entries[index + 1]?.marker ?? 100;
-        bands.push({
-            label: entry.label,
-            marker: entry.marker,
-            next,
-            hue: pf2eHudHueFromPercent((entry.marker + next) / 2)
-        });
-    });
-
-    bands.push({ label: status.full, marker: 100, next: 100, hue: pf2eHudHueFromPercent(100) });
-    return bands;
-}
-
-function getPF2eHudHealthBandForValue(value, max, status = getPF2eHudHealthStatus()) {
-    const current = Number(value);
-    const maximum = Number(max);
-    const bands = getPF2eHudHealthBands(status);
-
-    if (!Number.isFinite(current) || !Number.isFinite(maximum) || maximum <= 0) return null;
-    if (current <= 0) return bands[0] ?? null;
-    if (current >= maximum) return bands.at(-1) ?? null;
-
-    const percent = Math.max(current / maximum * 100, 1);
-    for (let i = status.entries.length - 1; i >= 0; i--) {
-        if (percent >= status.entries[i].marker) return bands[i + 1] ?? null;
-    }
-    return bands[1] ?? null;
-}
-
-function getPF2eHudActorHealthTotal(actor) {
-    const hp = actor?.system?.attributes?.hp || actor?.attributes?.hp;
-    const maxHP = Number(hp?.max);
-    if (!hp || !Number.isFinite(maxHP) || maxHP <= 0) return null;
-
-    const currentHP = clampNumber(hp.value, 0, maxHP);
-    const useStamina = actor.isOfType?.("character") && game.pf2e?.settings?.variants?.stamina;
-    const maxSP = Number((useStamina && hp.sp?.max) || 0);
-    const currentSP = clampNumber((useStamina && hp.sp?.value) || 0, 0, maxSP);
-    const tempHP = Math.max(Number(hp.temp) || 0, 0);
-
-    return {
-        value: currentHP + currentSP + tempHP,
-        max: maxHP + maxSP
-    };
-}
-
-function getPF2eHudCombatant(combatantId) {
-    if (!combatantId) return null;
-
-    const current = game.combat?.combatants?.get(combatantId);
-    if (current) return current;
-
-    const combats = game.combats instanceof Collection ? game.combats : game.combats?.contents ?? [];
-    for (const combat of combats) {
-        const combatant = combat?.combatants?.get(combatantId);
-        if (combatant) return combatant;
-    }
-
-    return null;
-}
-
-function setPF2eHudDiscreteHue(element, hue) {
-    if (!element) return;
-    if (!element.dataset.yulongOriginalHue) {
-        element.dataset.yulongOriginalHue = element.style.getPropertyValue("--hue") || "";
-    }
-    element.style.setProperty("--hue", String(Math.round(hue * 1000) / 1000));
-}
-
-function restorePF2eHudDiscreteHealthColors(root = document) {
-    root.querySelectorAll?.("[data-yulong-original-hue]").forEach(element => {
-        const original = element.dataset.yulongOriginalHue;
-        if (original) element.style.setProperty("--hue", original);
-        else element.style.removeProperty("--hue");
-        delete element.dataset.yulongOriginalHue;
-    });
-}
-
-function applyPF2eHudDiscreteTrackerHealthColors(status = getPF2eHudHealthStatus()) {
-    const tracker = document.querySelector("#pf2e-hud-tracker");
-    if (!tracker) return;
-
-    tracker.querySelectorAll("[data-combatant-id]").forEach(element => {
-        const combatantId = element.dataset.combatantId;
-        const combatant = getPF2eHudCombatant(combatantId);
-        const health = getPF2eHudActorHealthTotal(combatant?.actor);
-        const band = health && getPF2eHudHealthBandForValue(health.value, health.max, status);
-        const healthSpan = element.querySelector(".extras .group .entry:last-child > span[style*='--hue']");
-
-        if (band && healthSpan) setPF2eHudDiscreteHue(healthSpan, band.hue);
-    });
-}
-
-function applyPF2eHudDiscreteTooltipHealthColors(status = getPF2eHudHealthStatus()) {
-    const labelToBand = new Map(getPF2eHudHealthBands(status).map(band => [band.label.trim(), band]));
-
-    document.querySelectorAll("#pf2e-hud-tooltip [data-panel='health-status']").forEach(element => {
-        const band = labelToBand.get(element.textContent?.trim() || "");
-        if (band) setPF2eHudDiscreteHue(element, band.hue);
-    });
-}
-
-function applyPF2eHudDiscreteHealthColors() {
-    if (!game.modules.get(PF2E_HUD_MODULE_ID)?.active) return;
-    if (!game.settings.get(MODULE_ID, PF2E_HUD_DISCRETE_HEALTH_COLORS)) return;
-
-    const status = getPF2eHudHealthStatus();
-    applyPF2eHudDiscreteTrackerHealthColors(status);
-    applyPF2eHudDiscreteTooltipHealthColors(status);
-}
-
-function installPF2eHudDiscreteHealthColors() {
-    if (!game.modules.get(PF2E_HUD_MODULE_ID)?.active) return;
-
-    window.yulongHomebrew ??= {};
-    window.yulongHomebrew.applyPF2eHudDiscreteHealthColors = applyPF2eHudDiscreteHealthColors;
-    window.yulongHomebrew.restorePF2eHudDiscreteHealthColors = restorePF2eHudDiscreteHealthColors;
-
-    if (window.yulongHomebrew.__yulongPF2eHudDiscreteHealthColorsInstalled) return;
-    window.yulongHomebrew.__yulongPF2eHudDiscreteHealthColorsInstalled = true;
-
-    applyPF2eHudDiscreteHealthColors();
-
-    let refreshQueued = false;
-    const queueRefresh = () => {
-        if (refreshQueued) return;
-        refreshQueued = true;
-        requestAnimationFrame(() => {
-            refreshQueued = false;
-            applyPF2eHudDiscreteHealthColors();
-        });
-    };
-
-    const observer = new MutationObserver(() => {
-        queueRefresh();
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
-    window.yulongHomebrew.pf2eHudDiscreteHealthColorObserver = observer;
-
-    Hooks.on("updateActor", queueRefresh);
-    Hooks.on("updateCombat", queueRefresh);
-    Hooks.on("updateCombatant", queueRefresh);
-
-    console.log("Yulong Homebrew | PF2e HUD discrete health colors ready.");
 }
 
 function installToolbeltCompat() {
@@ -1684,20 +1433,6 @@ function installToolbeltCompatOn(parser) {
         );
     };
 
-    parser.hasRecentHolodeckSaveLog ??= function(targetName, outcome) {
-        const { ledger } = this.getHolodeckLedger();
-        const currentRound = game.combat?.round || 1;
-        const normalizedOutcome = this.normalizePF2eOutcome(outcome);
-        const logs = Array.isArray(ledger?.masterLog) ? ledger.masterLog : [];
-
-        return logs.slice(-40).some(logEntry => {
-            if (logEntry.yulongToolbeltSaveKey) return false;
-            if (logEntry.type !== "Save" || logEntry.source !== targetName) return false;
-            if (Number(logEntry.round || currentRound) !== currentRound) return false;
-            return !normalizedOutcome || this.normalizePF2eOutcome(logEntry.result) === normalizedOutcome;
-        });
-    };
-
     parser.getToolbeltApplicationKey ??= function(messageId, targetId, rollIndex) {
         return `${messageId}:${targetId}:${Number(rollIndex) || 0}`;
     };
@@ -1741,11 +1476,7 @@ function installToolbeltCompatOn(parser) {
             ...(data?.splashTargets || [])
         ]);
 
-        return Boolean(targetDoc && (
-            targetDoc.uuid === pending.targetUuid
-            || targetDoc.actor?.uuid === pending.targetActorUuid
-            || targetDoc.actor?.id === pending.targetActorId
-        ));
+        return Boolean(targetDoc && matchesActorReference(pending, targetDoc.actor || targetDoc));
     };
 
     parser.getHolodeckLedger ??= function() {
@@ -2219,7 +1950,8 @@ function installToolbeltCompatOn(parser) {
         const amount = hpUpdates.reduce((total, update) => total + Math.abs(Number(update.value)), 0);
         if (!Number.isFinite(amount) || amount <= 0) return null;
 
-        const actor = fromUuidSyncSafe(appliedDamage.uuid);
+        const targetDocument = fromUuidSyncSafe(appliedDamage.uuid);
+        const actor = targetDocument?.actor || targetDocument;
         const isHealing = appliedDamage.isHealing === true;
 
         // Preferred source: the HP values captured in preUpdateActor, which are exact.
@@ -2786,11 +2518,8 @@ function installToolbeltCompatOn(parser) {
 
         const targetDoc = fromUuidSyncSafe(applied.uuid);
         const targetActor = targetDoc?.actor || targetDoc;
-        const targetMatches = !pending.targetActorId && !pending.targetUuid
-            || pending.targetActorId === targetActor?.id
-            || pending.targetActorUuid === targetActor?.uuid
-            || pending.targetUuid === targetDoc?.uuid
-            || pending.targetUuid === applied.uuid;
+        const targetMatches = (!pending.targetActorId && !pending.targetActorUuid && !pending.targetUuid)
+            || matchesActorReference(pending, targetActor);
         if (!targetMatches) return false;
 
         if (!systemFlags.origin?.uuid && pending.originUuid) systemFlags.origin = { uuid: pending.originUuid };
@@ -2939,7 +2668,7 @@ function installToolbeltCompatOn(parser) {
     };
 
     parser.pushRecentHpChange ??= function(actor, change) {
-        const keys = [actor?.uuid, actor?.id].filter(Boolean);
+        const keys = actorHistoryKeys(actor);
         change.keys = keys;
         for (const key of keys) {
             const queue = this.recentHpChanges.get(key) || [];
@@ -2953,7 +2682,7 @@ function installToolbeltCompatOn(parser) {
     parser.peekRecentHpChange ??= function(actor) {
         const target = actor?.actor || actor;
         const now = Date.now();
-        for (const key of [target?.uuid, target?.id].filter(Boolean)) {
+        for (const key of actorHistoryKeys(target)) {
             const queue = this.recentHpChanges.get(key);
             if (!Array.isArray(queue)) continue;
             // Newest first: PF2e posts the damage-taken card straight after its own update, so the
@@ -3008,7 +2737,7 @@ function installToolbeltCompatOn(parser) {
     parser.consumeRecentHpChange = function(targetDoc, fallbackAmount, fallbackHealing, options = {}) {
         const actor = targetDoc?.actor || targetDoc;
         const now = Date.now();
-        const keys = [actor?.uuid, actor?.id, targetDoc?.uuid, targetDoc?.id].filter(Boolean);
+        const keys = actorHistoryKeys(actor);
 
         for (const key of keys) {
             const queue = this.recentHpChanges.get(key);
@@ -3068,7 +2797,7 @@ function installToolbeltCompatOn(parser) {
     parser.isAwaNativeAttributionAlreadyCorrect ??= function(sourceActor) {
         if (!game.combat?.active || !sourceActor) return false;
         const combatant = game.combat.combatant;
-        return combatant?.actorId === sourceActor.id || combatant?.actor?.id === sourceActor.id;
+        return matchesActorReference({ targetActorUuid: combatant?.actor?.uuid, targetActorId: combatant?.actorId }, sourceActor);
     };
 
     parser.recordPendingAwaToolbeltSource ??= function(event) {
@@ -3120,6 +2849,7 @@ function installToolbeltCompatOn(parser) {
             sourceActorId: sourceActor.id,
             targetActor,
             targetActorId: targetActor?.id,
+            targetActorUuid: targetActor?.uuid,
             targetUuid,
             timestamp: Date.now()
         };
@@ -3159,10 +2889,7 @@ function installToolbeltCompatOn(parser) {
 
     parser.pendingAwaSourceMatchesActor ??= function(pending, actor) {
         if (!pending || !actor) return false;
-        return pending.targetActorId === actor.id
-            || pending.targetActorUuid === actor.uuid
-            || pending.targetUuid === actor.uuid
-            || pending.targetUuid === actor.token?.uuid;
+        return matchesActorReference(pending, actor);
     };
 
     parser.consumePendingAwaToolbeltSource ??= function(actor) {
@@ -3182,26 +2909,25 @@ function installToolbeltCompatOn(parser) {
         delete compat.pendingAwaToolbeltSource;
         return {
             ...pending,
-            sourceActor: pending.sourceActor || game.actors.get(pending.sourceActorId) || fromUuidSyncSafe(pending.sourceActorUuid)
+            sourceActor: pending.sourceActor || (pending.sourceActorUuid ? fromUuidSyncSafe(pending.sourceActorUuid) : game.actors.get(pending.sourceActorId))
         };
     };
 
     parser.consumePendingAwaPF2eDamageSource ??= function(actor) {
-        const compat = window.yulongHomebrew;
-        const pending = compat?.pendingAwaPF2eDamageSource;
+        const pending = pendingDamageSources.get(actor?.uuid);
         if (!pending) return null;
 
         if (Date.now() - pending.timestamp > AWA_PF2E_PENDING_SOURCE_TIMEOUT_MS) {
-            delete compat.pendingAwaPF2eDamageSource;
+            pendingDamageSources.delete(actor.uuid);
             return null;
         }
 
         if (!this.pendingAwaSourceMatchesActor(pending, actor)) return null;
 
-        delete compat.pendingAwaPF2eDamageSource;
+        pendingDamageSources.delete(actor.uuid);
         return {
             ...pending,
-            sourceActor: pending.sourceActor || game.actors.get(pending.sourceActorId) || fromUuidSyncSafe(pending.sourceActorUuid)
+            sourceActor: pending.sourceActor || (pending.sourceActorUuid ? fromUuidSyncSafe(pending.sourceActorUuid) : game.actors.get(pending.sourceActorId))
         };
     };
 
@@ -3269,17 +2995,23 @@ function installToolbeltCompatOn(parser) {
         return false;
     };
 
-    parser.applyOneTimeAchievementHooks ??= async function(api, sourceActor, hookId, amount) {
+    parser.applyOneTimeAchievementHooks ??= function(api, sourceActor, hookId, amount) {
+        if (!canReceiveAwaCredit(sourceActor)) return;
+        if (!isPrimaryAchievementGM()) {
+            for (const achievement of api.getAchievements?.() || []) {
+                if (achievement.automationHookId !== hookId) continue;
+                requestAchievementUpdate(sourceActor, { kind: "one-time", achievementId: achievement.id, amount });
+            }
+            return;
+        }
+        return enqueueAchievement(sourceActor, () => this.applyOneTimeAchievementHooksNow(api, sourceActor, hookId, amount));
+    };
+
+    parser.applyOneTimeAchievementHooksNow ??= async function(api, sourceActor, hookId, amount) {
         const achievements = api.getAchievements?.() || [];
         for (const achievement of achievements) {
             if (achievement.automationHookId !== hookId) continue;
-            if (sourceActor.getFlag(AWA_MODULE_ID, achievement.id) === undefined) continue;
-            if (sourceActor.getFlag(AWA_MODULE_ID, achievement.id)) continue;
-            if (amount < Number(achievement.target || 0)) continue;
-            // AWA pins the progress flag to the target on completion; do the same so the bar in
-            // its UI does not sit at zero for a completed one-time achievement.
-            await setAwaProgressFlag(sourceActor, achievement.flag, Number(achievement.target || amount));
-            await api.grantAchievement(achievement.id, sourceActor);
+            await completeOneTimeAchievementNow(api, sourceActor, achievement, amount);
         }
     };
 
@@ -3289,22 +3021,7 @@ function installToolbeltCompatOn(parser) {
 
         for (const achievement of achievements) {
             if (!this.matchesAchievementMonsterFilter(achievement, killedActor)) continue;
-            if (sourceActor.getFlag(AWA_MODULE_ID, achievement.id) === undefined) continue;
-            if (sourceActor.getFlag(AWA_MODULE_ID, achievement.id)) continue;
-
-            if (!achievement.progressable) {
-                await api.grantAchievement(achievement.id, sourceActor);
-                continue;
-            }
-
-            const flag = achievement.flag;
-            const current = Number(sourceActor.getFlag(AWA_MODULE_ID, flag) || 0) + 1;
-            if (current >= Number(achievement.target || 0)) {
-                await setAwaProgressFlag(sourceActor, flag, Number(achievement.target || current));
-                await api.grantAchievement(achievement.id, sourceActor);
-            } else {
-                await setAwaProgressFlag(sourceActor, flag, current);
-            }
+            await advanceAwaCounterAchievement(api, sourceActor, achievement, 1);
         }
     };
 
@@ -3577,14 +3294,15 @@ function installToolbeltCompatOn(parser) {
         return this.nativeAwaCanDetectHealingConsumable(message) && this.hasAwaNativeOwnerHandler(actor);
     };
 
-    // AWA's checkItemUsedPF returns early whenever the message carries a pf2e context type, so
-    // context-bearing item cards are always ours.
+    // AWA owns primary no-context cards when an owner is connected. Derived
+    // context-bearing rolls are filtered out before either item counter runs.
     parser.awaNativeHandlesItemUse ??= function(message, actor) {
         const hasContext = Boolean(message?.flags?.pf2e?.context?.type);
         return !hasContext && this.hasAwaNativeOwnerHandler(actor);
     };
 
     parser.applyAwaPF2eItemAchievements ??= async function(message) {
+        if (!isPrimaryItemUseMessage(message)) return false;
         const api = this.getAchievementsApi();
         if (!api || !this.isAchievementsTrackingEnabled()) return false;
 
@@ -3644,10 +3362,8 @@ function installToolbeltCompatOn(parser) {
         const rerollType = typeof save.rerolled === "string"
             ? save.rerolled
             : (save.rerolled || save.isReroll ? "new" : null);
-        const isReroll = Boolean(rerollType);
         const isHeroPointReroll = rerollType === "hero";
-        const targetName = this.getHolodeckResolvedActorName(targetActor, targetDoc.name || targetActor.name);
-        if (!isReroll && this.hasRecentHolodeckSaveLog(targetName, entry.outcome)) return null;
+        // Exact message/variant/target/roll fingerprints below own deduplication.
 
         const systemKey = message.flags?.sf2e ? "sf2e" : "pf2e";
         const systemFlags = foundry.utils.deepClone(message.flags?.[systemKey] || {});
@@ -3876,10 +3592,12 @@ function installToolbeltCompatOn(parser) {
     parser.installAchievementsCompat();
 }
 
-Hooks.once("init", registerHomebrewSettings);
+Hooks.once("init", () => {
+    registerHomebrewSettings();
+});
 Hooks.once("ready", () => {
+    installAchievementWriteQueue();
     installFumbleSwitchWidgetCompat();
-    installPF2eHudDiscreteHealthColors();
     installTroopDamageHouseRules();
     installToolbeltCompat();
     setTimeout(installPatreonLowHpIncapacitation, 0);

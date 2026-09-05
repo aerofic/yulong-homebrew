@@ -21,7 +21,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
 
       - name: Run tests
         run: node --test tests/*.test.mjs
@@ -71,13 +71,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
-          cat > notes.md <<'NOTES'
-          Install in Foundry with this manifest URL:
-          `https://github.com/aerofic/yulong-homebrew/releases/latest/download/module.json`
-          NOTES
+          NOTES=".github/release-notes-${TAG#v}.md"
+          test -f "$NOTES"
           gh release create "$TAG" \
             dist/module.zip \
             dist/module.json \
             --title "$TAG" \
-            --notes-file notes.md \
+            --notes-file "$NOTES" \
             --generate-notes
