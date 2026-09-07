@@ -2,7 +2,7 @@
   "id": "yulong-homebrew",
   "title": "Yulong Homebrew",
   "description": "PF2e homebrew and compatibility: troop single-target damage caps and GM-reviewed area weakness cards, Toolbelt to Holodeck statistics, Automatic Achievements attribution and counting, low-HP incapacitation handling, and a hideable Fumble Switch widget.",
-  "version": "1.1.5",
+  "version": "1.1.6",
   "socket": true,
   "compatibility": {
     "minimum": "14",

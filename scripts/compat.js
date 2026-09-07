@@ -24,9 +24,9 @@ const TROOP_HOUSERULES_ENABLED = "troopHouseRulesEnabled";
 const TROOP_AREA_WEAKNESS_ADVISOR_ENABLED = "troopAreaWeaknessAdvisorEnabled";
 const PATREON_INCAPACITATION_LABEL = "PF2E.TraitIncapacitation";
 const TROOP_SINGLE_TARGET_DAMAGE_CAP_DENOMINATOR = 20;
-const TROOP_AREA_FIREBALL_BASE_RADIUS_FEET = 20;
-const TROOP_AREA_DOUBLE_RADIUS_FEET = 60;
-const TROOP_AREA_QUADRUPLE_RADIUS_FEET = 400;
+// Inclusive upper radius bounds for x1 through x5; larger areas use x6.
+const TROOP_AREA_RADIUS_UPPER_BOUNDS_FEET = Object.freeze([20, 40, 60, 120, 400]);
+const TROOP_AREA_MAX_MULTIPLIER = TROOP_AREA_RADIUS_UPPER_BOUNDS_FEET.length + 1;
 const TROOP_AREA_EMANATION_RADIUS_DIVISOR = 1.4;
 const TROOP_AREA_LINE_WIDTH_FEET = 5;
 const AWA_MODULE_ID = "achievements-with-automation";
@@ -500,10 +500,9 @@ function getEquivalentBurstRadius(area) {
 }
 
 function getTroopAreaWeaknessMultiplier(equivalentBurstRadius) {
-    if (!Number.isFinite(equivalentBurstRadius) || equivalentBurstRadius <= TROOP_AREA_FIREBALL_BASE_RADIUS_FEET) return 1;
-    if (equivalentBurstRadius <= TROOP_AREA_DOUBLE_RADIUS_FEET) return 2;
-    if (equivalentBurstRadius < TROOP_AREA_QUADRUPLE_RADIUS_FEET) return 3;
-    return 4;
+    if (!Number.isFinite(equivalentBurstRadius)) return 1;
+    const band = TROOP_AREA_RADIUS_UPPER_BOUNDS_FEET.findIndex(bound => equivalentBurstRadius <= bound);
+    return band < 0 ? TROOP_AREA_MAX_MULTIPLIER : band + 1;
 }
 
 function formatTroopAreaNumber(value) {
@@ -595,7 +594,7 @@ function escapeYulongHTML(value) {
 function clampTroopAreaMultiplier(value) {
     const number = Number(value);
     if (!Number.isFinite(number)) return 1;
-    return Math.min(Math.max(Math.trunc(number), 1), 4);
+    return Math.min(Math.max(Math.trunc(number), 1), TROOP_AREA_MAX_MULTIPLIER);
 }
 
 function getTroopAreaExtraWeaknessDamage(weaknessValue, multiplier) {
@@ -607,7 +606,7 @@ function buildTroopAreaWeaknessAdvisorContent(data) {
     const weaknessValue = Number(data.weakness?.value || 0);
     const extraDamage = getTroopAreaExtraWeaknessDamage(weaknessValue, selectedMultiplier);
     const disabled = data.executed || data.ignored ? "disabled" : "";
-    const multiplierOptions = [1, 2, 3, 4]
+    const multiplierOptions = Array.from({ length: TROOP_AREA_MAX_MULTIPLIER }, (_, index) => index + 1)
         .map(multiplier => `<option value="${multiplier}" ${multiplier === selectedMultiplier ? "selected" : ""}>${multiplier}x</option>`)
         .join("");
     const status = data.executed
