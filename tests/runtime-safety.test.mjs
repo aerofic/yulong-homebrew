@@ -51,6 +51,49 @@ function troopEnvironment() {
     return { ...env, actor, original, delta, run };
 }
 
+test('configurable troop cap defaults to 1/20 and preserves rounding and minimum damage', () => {
+    const { c, settings } = environment();
+    const actor = { hitPoints: { max: 201 } };
+    assert.equal(c.getTroopSingleTargetDamageCap(actor), 11);
+    for (const [denominator, expected] of [[10, 21], [5, 41], [2.5, 81], [1, 201], [1000, 1]]) {
+        settings.set('yulong-homebrew.troopSingleTargetDamageCapDenominator', denominator);
+        assert.equal(c.getTroopSingleTargetDamageCap(actor), expected);
+    }
+    for (const value of [0, -1, 0.5, NaN, Infinity, true, '10']) {
+        settings.set('yulong-homebrew.troopSingleTargetDamageCapDenominator', value);
+        assert.equal(c.getTroopSingleTargetDamageCap(actor), 11);
+    }
+    c.game.settings.get = () => { throw Error('missing setting'); };
+    assert.equal(c.getTroopSingleTargetDamageCap(actor), 11);
+    assert.equal(c.getTroopSingleTargetDamageCap({ hitPoints: { max: 0 } }), null);
+});
+
+test('configured cap changes next application without capping area, final or healing; toggle still disables', async () => {
+    const { run, settings } = troopEnvironment();
+    settings.set('yulong-homebrew.troopSingleTargetDamageCapDenominator', 5);
+    assert.equal((await run({ damage: 100 })).totalApplied, 40);
+    settings.set('yulong-homebrew.troopSingleTargetDamageCapDenominator', 10);
+    assert.equal((await run({ damage: 100 })).totalApplied, 20);
+    assert.equal((await run({ damage: 7 })).totalApplied, 7);
+    assert.equal((await run({ damage: 100, rollOptions: new Set(['area-damage']) })).totalApplied, 100);
+    assert.equal((await run({ damage: 100, final: true })).totalApplied, 100);
+    assert.equal((await run({ damage: -100 })).totalApplied, -100);
+    settings.set('yulong-homebrew.troopHouseRulesEnabled', false);
+    assert.equal((await run({ damage: 100 })).totalApplied, 100);
+});
+
+test('denominator is registered as a world-scoped validated number with default 20', () => {
+    const { c } = environment(); const registered = new Map();
+    c.game.settings.register = (namespace, key, config) => registered.set(key, config);
+    c.foundry.data = { fields: { NumberField: class { constructor(options) { this.options = options; } } } };
+    c.registerHomebrewSettings();
+    const config = registered.get('troopSingleTargetDamageCapDenominator');
+    assert.equal(config.scope, 'world'); assert.equal(config.default, 20);
+    assert.equal(config.type.options.min, 1); assert.equal(config.type.options.nullable, false);
+    assert.equal(config.type.options.required, true);
+    assert.doesNotMatch(registered.get('troopHouseRulesEnabled').hint, /1\/20/);
+});
+
 test('F03 simultaneous single-target, area, final and healing applications stay separate', async () => {
     const { run, actor, original } = troopEnvironment(), gate = Promise.withResolvers();
     const a = run({ damage: 100 }, gate.promise);
@@ -135,7 +178,7 @@ test('F08 synthetic Actor identities never fall back to the common base id', () 
     assert.equal(matchesActorReference({ targetActorId: 'base', targetUuid: a.uuid }, b), false);
     assert.equal(matchesActorReference({ targetActorUuid: a.uuid }, a), true);
     const { c } = environment(), p = parser(c);
-    p.pushRecentHpChange(a, { id: 'hp', amount: 10, previousHp: 10, currentHp: 0, actor: a, timestamp: Date.now() });
+    p.pushRecentHpChange(a, { id: 'hp', applicationId: 'damage', completed: true, amount: 10, delta: 10, previousHp: 10, currentHp: 0, actor: a, timestamp: Date.now() });
     assert.equal(p.peekRecentHpChange(b), null);
     assert.equal(p.consumeRecentHpChange({ actor: b }, 10, false, { requireRecent: true }), null);
     assert.equal(p.consumeRecentHpChange({ actor: a }, 10, false, { requireRecent: true }).currentHp, 0);

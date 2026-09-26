@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import { collectTokenRanges, explicitDescriptionRanges } from '../scripts/range-data.js';
 import { squareRangeOutline } from '../scripts/range-geometry.js';
+import { featureColors, groupRangeFeatures, coloredRangeSegments, gridlessRangeSegments } from '../scripts/range-colors.js';
 
 const actor = (extra = {}) => ({ type: 'npc', uuid: 'Actor.a', system: { attributes: { reach: { base: 5 } }, actions: [] }, items: [], auras: new Map(), ...extra });
 const melee = (name, reach) => ({ type: 'melee', name, reach, isMelee: true });
@@ -142,14 +143,14 @@ function environment() {
         destroy({ children } = {}) { if (children) for (const child of this.children) child.destroy(); this.destroyed = true; }
     }
     class Graphics extends Container {
-        segments = []; lineStyle(...args) { this.style = args; return this; }
+        segments = []; styles = []; lineStyle(...args) { this.style = args; this.styles.push(args); return this; }
         moveTo(x, y) { this.start = { x, y }; return this; }
         lineTo(x, y) { this.segments.push([this.start, { x, y }]); return this; }
         drawRoundedRect(...args) { this.rect = args; }
         beginFill() { assert.fail('must never fill range area'); }
     }
     class Text extends Container {
-        constructor(text) { super(); this.text = text; }
+        constructor(text, style) { super(); this.text = text; this.style = style; }
         anchor = { set() {} }; position = { set() {} };
     }
     const a = actor(); a.system.attributes.reach.base = 10;
@@ -160,7 +161,7 @@ function environment() {
     const canvas = { ready: true, scene: { id: 's' }, grid, tokens: { controlled: [token], preview: { children: [] } }, interface: { grid: { highlight: new Container() } } };
     const game = { user: { id: 'gm', isGM: true }, system: { id: 'pf2e' }, i18n: { lang: 'cn', localize: key => key } };
     const source = fs.readFileSync(new URL('../scripts/selected-token-ranges.js', import.meta.url), 'utf8').replace(/^import .*;\r?\n/gm, '').replace(/^export /gm, '');
-    const context = vm.createContext({ collectTokenRanges, squareRangeOutline, Hooks, console });
+    const context = vm.createContext({ collectTokenRanges, squareRangeOutline, groupRangeFeatures, coloredRangeSegments, gridlessRangeSegments, Hooks, console });
     vm.runInContext(source, context);
     const controller = context.createSelectedTokenRangeController({ game, canvas, Hooks, PIXI: { Container, Graphics, Text },
         requestAnimationFrame(fn) { const key = ++id; frames.set(key, fn); return key; }, cancelAnimationFrame(key) { frames.delete(key); } });
@@ -172,15 +173,67 @@ test('controller renders noninteractive outline only; only reach requests the 10
     const e = environment(); e.controller.setEnabled(true); e.flush();
     const layer = e.parent.children[0];
     assert.equal(layer.eventMode, 'none'); assert.equal(layer.interactiveChildren, false);
-    assert.equal(layer.children.length, 6);
+    assert.equal(layer.children.length, 5);
     const outlines = layer.children.filter(c => c.segments);
     assert.ok(outlines.every(g => g.style[2] === 0.25 && g.eventMode === 'none'));
-    assert.equal(outlines.filter(g => unitEdges(g.segments).has(edgeKey({ x: 400, y: 300 }, { x: 400, y: 400 }))).length, 1);
+    assert.equal(outlines.filter(g => g.segments.some(([a, b]) => a.x === 400 && b.x === 400 && Math.min(a.y, b.y) >= 300)).length, 1);
     assert.deepEqual(new Set(e.measured), new Set([null, 10]));
     assert.ok(layer.children.some(c => c.text?.includes('触及')));
     assert.ok(layer.children.every(c => !c.text?.includes('最大射程')));
     e.controller.destroy(); assert.equal(layer.destroyed, true); assert.equal(e.parent.children.length, 0);
     assert.equal([...e.events.values()].reduce((n, m) => n + m.size, 0), 0);
+});
+
+test('feature colors are distinct, deterministic, order-independent and shared by same-name usages', () => {
+    const ranges = [{ kind: 'reach', distance: 15, names: ['Jaws', 'Tail', 'Fear'] }, { kind: 'self', distance: 20, names: ['Fear'] }];
+    const colors = featureColors(ranges);
+    assert.equal(colors.size, 3); assert.equal(new Set(colors.values()).size, 3);
+    assert.deepEqual(colors, featureColors(ranges.toReversed().map(r => ({ ...r, names: r.names.toReversed() }))));
+    const many = featureColors([{ names: Array.from({ length: 50 }, (_, i) => `Feature ${i}`) }]);
+    assert.equal(new Set(many.values()).size, 50);
+    const groups = groupRangeFeatures(ranges, 1);
+    assert.equal(groups[0].features[0].color, groups[1].features.find(f => f.name === 'Fear').color);
+});
+
+test('coincident ordinary ranges share alternating colors without merging the 10 ft reach exception', () => {
+    const ranges = [
+        { kind: 'reach', distance: 10, names: ['Jaws', 'Tail'] },
+        { kind: 'self', distance: 10, names: ['Fear'] },
+        { kind: 'increment', distance: 10, names: ['Throw'] }
+    ];
+    const groups = groupRangeFeatures(ranges, 1);
+    assert.equal(groups.length, 2);
+    assert.equal(groups.find(g => g.reach === 10).features.length, 2);
+    assert.equal(groups.find(g => g.reach === null).features.length, 2);
+    assert.equal(groupRangeFeatures(ranges, 0).length, 1);
+    const pieces = coloredRangeSegments([[{ x: 0, y: 0 }, { x: 100, y: 0 }]], [11, 22], 25);
+    assert.deepEqual(pieces.map(p => p.color), [11, 22, 11, 22]);
+    assert.equal(pieces[0].a.x, 0); assert.equal(pieces.at(-1).b.x, 100);
+    assert.ok(pieces.every((p, i) => p.a.y === 0 && p.b.y === 0 && (i === 0 || p.a.x === pieces[i - 1].b.x)));
+    assert.equal(coloredRangeSegments([[{ x: 0, y: 0 }, { x: 100, y: 0 }]], [11], 25).length, 1);
+});
+
+test('gridless colored outline stays closed and expands from the whole footprint', () => {
+    const segments = gridlessRangeSegments({ x: 100, y: 200, width: 200, height: 300 }, 100);
+    const points = segments.flat();
+    assert.equal(Math.min(...points.map(p => p.x)), 0); assert.equal(Math.max(...points.map(p => p.x)), 400);
+    assert.equal(Math.min(...points.map(p => p.y)), 100); assert.equal(Math.max(...points.map(p => p.y)), 600);
+    for (let i = 0; i < segments.length; i++) assert.deepEqual(segments[i][1], segments[(i + 1) % segments.length][0]);
+});
+
+test('same-distance feature labels match visible stripe colors and stay stable after movement', () => {
+    const e = environment();
+    e.token.actor.auras.set('poison', { slug: 'poison', radius: 10 });
+    e.controller.setEnabled(true); e.flush();
+    const snapshot = () => e.parent.children[0].children.filter(c => c.text).map(c => [c.text, c.style.fill]);
+    const before = snapshot();
+    assert.equal(new Set(before.map(([, color]) => color)).size, 4);
+    const stripes = e.parent.children[0].children.filter(c => c.segments).flatMap(c => c.styles.map(s => s[1]));
+    for (const [, color] of before) assert.ok(stripes.includes(color));
+    e.Hooks.call('refreshToken', e.token, { refreshPosition: true }); e.flush();
+    assert.deepEqual(snapshot(), before);
+    e.controller.setEnabled(false); e.controller.setEnabled(true); e.flush();
+    assert.deepEqual(snapshot(), before);
 });
 
 test('player clients, disabled setting, multi-selection and deselection render nothing', () => {

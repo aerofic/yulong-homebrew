@@ -10,7 +10,9 @@ import { actorHistoryKeys, createDocumentQueue, isPrimaryItemUseMessage, matches
 
 const enqueueDamage = createDocumentQueue();
 const enqueueAchievement = createDocumentQueue();
+const enqueueTroopCard = createDocumentQueue();
 const healthDeltaScopes = new WeakMap();
+const damageApplications = new Map();
 const pendingDamageSources = new Map();
 const processedAchievementRequests = new Set();
 
@@ -23,7 +25,8 @@ const FUMBLE_SWITCH_WIDGET_VISIBLE = "fumbleSwitchWidgetVisible";
 const TROOP_HOUSERULES_ENABLED = "troopHouseRulesEnabled";
 const TROOP_AREA_WEAKNESS_ADVISOR_ENABLED = "troopAreaWeaknessAdvisorEnabled";
 const PATREON_INCAPACITATION_LABEL = "PF2E.TraitIncapacitation";
-const TROOP_SINGLE_TARGET_DAMAGE_CAP_DENOMINATOR = 20;
+const TROOP_DAMAGE_CAP_DENOMINATOR_SETTING = "troopSingleTargetDamageCapDenominator";
+const DEFAULT_TROOP_DAMAGE_CAP_DENOMINATOR = 20;
 // Inclusive upper radius bounds for x1 through x5; larger areas use x6.
 const TROOP_AREA_RADIUS_UPPER_BOUNDS_FEET = Object.freeze([20, 40, 60, 120, 400]);
 const TROOP_AREA_MAX_MULTIPLIER = TROOP_AREA_RADIUS_UPPER_BOUNDS_FEET.length + 1;
@@ -335,11 +338,23 @@ function registerHomebrewSettings() {
 
     game.settings.register(MODULE_ID, TROOP_HOUSERULES_ENABLED, {
         name: "PF2e troop single-target damage cap",
-        hint: "Caps single-target damage to troops at 1/20 of maximum HP after PF2e has applied immunities, weaknesses, resistances, shields, and hardness.",
+        hint: "Caps single-target damage to troops at maximum HP divided by the configured denominator after PF2e has applied immunities, weaknesses, resistances, shields, and hardness.",
         scope: "world",
         config: true,
         type: Boolean,
         default: true
+    });
+
+    const zh = /^(cn|zh)(?:-|$)/i.test(game.i18n.lang ?? "");
+    game.settings.register(MODULE_ID, TROOP_DAMAGE_CAP_DENOMINATOR_SETTING, {
+        name: zh ? "军队单体伤害上限分母" : "Troop single-target damage cap denominator",
+        hint: zh ? "上限 = 最大 HP ÷ 此数，向上取整，最低 1 点。默认 20（1/20）；10 为 1/10，5 为 1/5。可输入大于等于 1 的数值，仅在上方开关开启时生效；不影响区域伤害或治疗。"
+            : "Cap = maximum HP divided by this number, rounded up, minimum 1. Default 20 means 1/20; 10 means 1/10; 5 means 1/5. Enter a number of at least 1. Only applies while the cap is enabled; does not affect area damage or healing.",
+        scope: "world",
+        config: true,
+        // V14 ClientSettings accepts DataField instances and validates them on set.
+        type: new foundry.data.fields.NumberField({ required: true, nullable: false, min: 1, initial: DEFAULT_TROOP_DAMAGE_CAP_DENOMINATOR }),
+        default: DEFAULT_TROOP_DAMAGE_CAP_DENOMINATOR
     });
 
     game.settings.register(MODULE_ID, TROOP_AREA_WEAKNESS_ADVISOR_ENABLED, {
@@ -408,7 +423,17 @@ function installPF2eCheckRollWrapper() {
 function getTroopSingleTargetDamageCap(actor) {
     const maxHP = Number(actor?.hitPoints?.max ?? actor?.system?.attributes?.hp?.max);
     if (!Number.isFinite(maxHP) || maxHP <= 0) return null;
-    return Math.max(Math.ceil(maxHP / TROOP_SINGLE_TARGET_DAMAGE_CAP_DENOMINATOR), 1);
+    return Math.max(Math.ceil(maxHP / getTroopDamageCapDenominator()), 1);
+}
+
+function getTroopDamageCapDenominator() {
+    try {
+        const value = game.settings.get(MODULE_ID, TROOP_DAMAGE_CAP_DENOMINATOR_SETTING);
+        return typeof value === "number" && Number.isFinite(value) && value >= 1
+            ? value : DEFAULT_TROOP_DAMAGE_CAP_DENOMINATOR;
+    } catch {
+        return DEFAULT_TROOP_DAMAGE_CAP_DENOMINATOR;
+    }
 }
 
 function isSplashOnlyDamage(damage) {
@@ -522,7 +547,6 @@ function getSourceActorFromItem(item) {
 }
 
 function getTroopAreaWeaknessAdvisorContext(actor, params) {
-    if (!areTroopHouseRulesEnabled()) return null;
     if (!isTroopAreaWeaknessAdvisorEnabled()) return null;
     if (!game.user?.isGM) return null;
     if (!isTroopActor(actor)) return null;
@@ -605,7 +629,7 @@ function buildTroopAreaWeaknessAdvisorContent(data) {
     const selectedMultiplier = clampTroopAreaMultiplier(data.selectedMultiplier ?? data.suggestedMultiplier);
     const weaknessValue = Number(data.weakness?.value || 0);
     const extraDamage = getTroopAreaExtraWeaknessDamage(weaknessValue, selectedMultiplier);
-    const disabled = data.executed || data.ignored ? "disabled" : "";
+    const disabled = data.executed || data.ignored || data.processing ? "disabled" : "";
     const multiplierOptions = Array.from({ length: TROOP_AREA_MAX_MULTIPLIER }, (_, index) => index + 1)
         .map(multiplier => `<option value="${multiplier}" ${multiplier === selectedMultiplier ? "selected" : ""}>${multiplier}x</option>`)
         .join("");
@@ -613,10 +637,12 @@ function buildTroopAreaWeaknessAdvisorContent(data) {
         ? `<p><em>Executed by ${escapeYulongHTML(data.executedByName || "a GM")} for ${formatTroopAreaNumber(data.extraDamage || 0)} extra damage.</em></p>`
         : data.ignored
             ? `<p><em>Ignored by ${escapeYulongHTML(data.ignoredByName || "a GM")}.</em></p>`
-            : "";
+            : data.processing
+                ? "<p><em>处理中；若执行中断，请 GM 核对生命值。此卡已锁定，避免重复扣血。</em></p>"
+                : "";
 
     return `
-<div class="yulong-troop-area-weakness-card" data-yulong-card-id="${escapeYulongHTML(data.cardId)}" data-yulong-weakness-value="${formatTroopAreaNumber(weaknessValue)}">
+<div class="yulong-troop-area-weakness-card" data-yulong-card-id="${escapeYulongHTML(data.cardId)}" data-yulong-revision="${Number(data.revision) || 0}" data-yulong-weakness-value="${formatTroopAreaNumber(weaknessValue)}">
   <h3>Troop Area Weakness Advisor</h3>
   <p><strong>Target:</strong> ${escapeYulongHTML(data.actorName)}<br>
   <strong>Source:</strong> ${escapeYulongHTML(data.itemName)}<br>
@@ -701,11 +727,14 @@ function recordPendingAwaTroopAreaWeaknessSource(data, targetActor, sourceActor)
 }
 
 async function updateTroopAreaWeaknessAdvisorMessage(message, data) {
-    await message.setFlag(MODULE_ID, "troopAreaWeakness", data);
-    await message.update({ content: buildTroopAreaWeaknessAdvisorContent(data) });
+    await message.update({
+        [`flags.${MODULE_ID}.troopAreaWeakness`]: data,
+        content: buildTroopAreaWeaknessAdvisorContent(data)
+    });
 }
 
 async function executeTroopAreaWeaknessAdvisor(message, card, multiplier) {
+    if (!isPrimaryAchievementGM() || card.executed || card.ignored || card.processing) return;
     const { actor, token } = getTroopAreaWeaknessTarget(card);
     if (!actor || !token) {
         ui.notifications.warn("Yulong Homebrew | Could not resolve the troop target for this area weakness card.");
@@ -715,16 +744,38 @@ async function executeTroopAreaWeaknessAdvisor(message, card, multiplier) {
         ui.notifications.warn("Yulong Homebrew | The target is no longer a troop.");
         return;
     }
+    if (!actor.canUserModify(game.user, "update")) return;
 
     const currentWeakness = getTroopAreaDamageWeakness(actor);
-    const weaknessValue = Number(currentWeakness?.value ?? card.weakness?.value ?? 0);
+    const weaknessValue = Number(currentWeakness?.value);
+    if (!Number.isFinite(weaknessValue) || weaknessValue <= 0) {
+        ui.notifications.warn("Yulong Homebrew | 目标已没有区域伤害弱点，未执行额外伤害。");
+        return;
+    }
     const selectedMultiplier = clampTroopAreaMultiplier(multiplier);
+    if (weaknessValue !== Number(card.weakness?.value)) {
+        await updateTroopAreaWeaknessAdvisorMessage(message, {
+            ...card, selectedMultiplier,
+            weakness: { ...card.weakness, value: weaknessValue },
+            revision: (Number(card.revision) || 0) + 1
+        });
+        ui.notifications.warn("Yulong Homebrew | 弱点值已变化，已更新卡片预览。请重新确认后执行。");
+        return;
+    }
+    if (!(Number(card.rawDamage) > weaknessValue)) {
+        ui.notifications.warn("Yulong Homebrew | 原生伤害未超过当前弱点值，不能触发多倍弱点。");
+        return;
+    }
     const extraDamage = getTroopAreaExtraWeaknessDamage(weaknessValue, selectedMultiplier);
     if (extraDamage <= 0) {
         ui.notifications.info("Yulong Homebrew | The selected multiplier adds no extra area weakness damage.");
         return;
     }
 
+    // Persist before damage: an ambiguous failure must never make this card retryable.
+    await updateTroopAreaWeaknessAdvisorMessage(message, {
+        ...card, selectedMultiplier, processing: true, processingAt: Date.now(), processingBy: game.user.id
+    });
     const sourceItem = getTroopAreaWeaknessSourceItem(card);
     const sourceActor = getTroopAreaWeaknessSourceActor(card, sourceItem);
     recordPendingAwaTroopAreaWeaknessSource(card, actor, sourceActor);
@@ -742,6 +793,7 @@ async function executeTroopAreaWeaknessAdvisor(message, card, multiplier) {
         selectedMultiplier,
         extraDamage,
         executed: true,
+        processing: false,
         executedAt: Date.now(),
         executedBy: game.user.id,
         executedByName: game.user.name,
@@ -765,6 +817,23 @@ async function ignoreTroopAreaWeaknessAdvisor(message, card) {
     await updateTroopAreaWeaknessAdvisorMessage(message, updated);
 }
 
+async function handleTroopAreaActionRequest(request, senderId) {
+    if (request?.kind !== "troop-area-action" || !isPrimaryAchievementGM()) return;
+    const sender = game.users.get(senderId);
+    if (!sender?.isGM || !sender.active || !["apply", "ignore"].includes(request.action)) return;
+    const message = game.messages.get(request.messageId);
+    if (!message?.canUserModify(game.user, "update")) return;
+    return enqueueTroopCard(message, async () => {
+        // Re-read after acquiring the queue; two stale clicks must not confirm a refreshed preview.
+        const currentMessage = game.messages.get(request.messageId);
+        const card = currentMessage?.getFlag(MODULE_ID, "troopAreaWeakness");
+        if (!card || card.executed || card.ignored || card.processing) return;
+        if ((Number(card.revision) || 0) !== request.revision || Number(card.weakness?.value) !== request.weaknessValue) return;
+        if (request.action === "ignore") return ignoreTroopAreaWeaknessAdvisor(currentMessage, card);
+        return executeTroopAreaWeaknessAdvisor(currentMessage, card, request.multiplier);
+    });
+}
+
 async function handleTroopAreaWeaknessAdvisorClick(event) {
     const button = event.target?.closest?.("button[data-yulong-troop-area-action]");
     if (!button) return;
@@ -781,18 +850,19 @@ async function handleTroopAreaWeaknessAdvisorClick(event) {
     const message = messageElement ? game.messages.get(messageElement.dataset.messageId) : null;
     const card = message?.getFlag?.(MODULE_ID, "troopAreaWeakness");
     if (!message || !card) return;
-    if (card.executed || card.ignored) return;
+    if (card.executed || card.ignored || card.processing) return;
 
     const action = button.dataset.yulongTroopAreaAction;
-    if (action === "ignore") {
-        await ignoreTroopAreaWeaknessAdvisor(message, card);
-        return;
-    }
-
-    if (action !== "apply") return;
+    if (!["apply", "ignore"].includes(action)) return;
     const cardElement = button.closest(".yulong-troop-area-weakness-card");
     const multiplier = cardElement?.querySelector("[data-yulong-troop-area-multiplier]")?.value ?? card.suggestedMultiplier;
-    await executeTroopAreaWeaknessAdvisor(message, card, multiplier);
+    const request = {
+        kind: "troop-area-action", messageId: message.id, action, multiplier,
+        revision: Number(cardElement?.dataset.yulongRevision ?? card.revision) || 0,
+        weaknessValue: Number(cardElement?.dataset.yulongWeaknessValue ?? card.weakness?.value)
+    };
+    if (isPrimaryAchievementGM()) await handleTroopAreaActionRequest(request, game.user.id);
+    else game.socket.emit(`module.${MODULE_ID}`, request);
 }
 
 function handleTroopAreaWeaknessAdvisorChange(event) {
@@ -811,12 +881,53 @@ function installTroopAreaWeaknessAdvisorChatHandler() {
     window.yulongHomebrew ??= {};
     if (window.yulongHomebrew.__yulongTroopAreaWeaknessAdvisorChatHandlerInstalled) return;
     window.yulongHomebrew.__yulongTroopAreaWeaknessAdvisorChatHandlerInstalled = true;
+    game.socket.on(`module.${MODULE_ID}`, (request, senderId) => {
+        void handleTroopAreaActionRequest(request, senderId).catch(error => {
+            console.warn("Yulong Homebrew | Troop area action failed; check the locked card and target HP.", error);
+            ui.notifications.warn("Yulong Homebrew | 区域弱点操作未完成，请核对卡片状态和目标生命值。");
+        });
+    });
 
     document.body.addEventListener("click", event => {
         void handleTroopAreaWeaknessAdvisorClick(event)
             .catch(error => console.warn("Yulong Homebrew | Failed to handle troop area weakness advisor card.", error));
     });
     document.body.addEventListener("change", handleTroopAreaWeaknessAdvisorChange);
+}
+
+const HP_COMPONENT_PATHS = ["system.attributes.hp.value", "system.attributes.hp.temp", "system.attributes.hp.sp.value"];
+
+function damageUpdateSignature(updates) {
+    return JSON.stringify((Array.isArray(updates) ? updates : [])
+        .filter(update => HP_COMPONENT_PATHS.includes(update?.path) && Number.isFinite(Number(update.value)) && Number(update.value) !== 0)
+        .map(update => [update.path, Number(update.value)]).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function captureDamageApplication(actor, args, result, scope) {
+    if (!scope || !args?.hp || !result?.updates) return;
+    const previousHp = Number(args.hp.value);
+    const currentHp = Number(result.updates[HP_COMPONENT_PATHS[0]] ?? previousHp);
+    const values = [args.hp.value, args.hp.temp ?? 0, args.sp?.value ?? 0];
+    const updates = HP_COMPONENT_PATHS.flatMap((path, index) => {
+        if (result.updates[path] === undefined) return [];
+        const value = Number(values[index]) - Number(result.updates[path]);
+        return Number.isFinite(value) && value !== 0 ? [{ path, value }] : [];
+    });
+    if (!Number.isFinite(previousHp) || !Number.isFinite(currentHp) || !updates.length) return;
+    scope.snapshot = { applicationId: scope.applicationId, actorUuid: actor.uuid, previousHp, currentHp, updates };
+}
+
+// PF2e 8.5.1 emits this native card inside applyDamage, after updating HP.
+// V14's initiating-client preCreate hook allows updateSource on the pending document.
+function stampDamageApplication(message) {
+    const applied = message.flags?.pf2e?.appliedDamage;
+    const scope = damageApplications.get(applied?.uuid);
+    const snapshot = scope?.snapshot;
+    if (!snapshot || applied.isReverted || damageUpdateSignature(applied.updates) !== damageUpdateSignature(snapshot.updates)) return;
+    message.updateSource({ [`flags.${MODULE_ID}.damageApplication`]: snapshot });
+    // Native cards own statistics even if a Toolbelt dialog took longer than the click timeout.
+    scope.nativeMessageCreated = true;
+    if (scope.hpChange) scope.hpChange.nativeMessageCreated = true;
 }
 
 function installTroopDamageHouseRules() {
@@ -842,6 +953,7 @@ function installTroopDamageHouseRules() {
             args = { ...args, delta };
         }
         const result = wrapped(args);
+        captureDamageApplication(this, args, result, scope);
         if (scope?.advisor && Number.isFinite(delta) && delta > 0) {
             scope.captured = { delta, totalApplied: Number(result?.totalApplied) };
         }
@@ -857,10 +969,12 @@ function installTroopDamageHouseRules() {
                 reason: "pf2e-apply-damage"
             });
             const cap = shouldCapTroopSingleTargetDamage(this, params) ? getTroopSingleTargetDamageCap(this) : null;
-            const scope = { cap, breakdown, advisor: cap ? null : getTroopAreaWeaknessAdvisorContext(this, params) };
+            const scope = { applicationId: foundry.utils.randomID(), cap, breakdown, advisor: cap ? null : getTroopAreaWeaknessAdvisorContext(this, params) };
             healthDeltaScopes.set(this, scope);
+            damageApplications.set(this.uuid, scope);
             try {
                 const result = await wrapped({ ...params, breakdown });
+                scope.completed = true;
                 if (scope.advisor && scope.captured) {
                     const { delta, totalApplied } = scope.captured;
                     void createTroopAreaWeaknessAdvisorMessage({
@@ -870,11 +984,14 @@ function installTroopDamageHouseRules() {
                 }
                 return result;
             } finally {
+                if (scope.hpChange) scope.hpChange.completed = scope.completed === true;
                 healthDeltaScopes.delete(this);
+                damageApplications.delete(this.uuid);
                 pendingDamageSources.delete(this.uuid);
             }
         });
     }, "WRAPPER");
+    Hooks.on("preCreateChatMessage", stampDamageApplication);
     installTroopAreaWeaknessAdvisorChatHandler();
     window.yulongHomebrew.__yulongTroopDamageHouseRulesInstalled = true;
 
@@ -1940,7 +2057,7 @@ function installToolbeltCompatOn(parser) {
         return changed;
     };
 
-    parser.getAppliedDamageSummary ??= function(appliedDamage) {
+    parser.getAppliedDamageSummary ??= function(appliedDamage, snapshot) {
         if (!appliedDamage || appliedDamage.isReverted) return null;
         const updates = Array.isArray(appliedDamage.updates) ? appliedDamage.updates : [];
         const hpUpdates = updates.filter(update => typeof update?.path === "string"
@@ -1949,37 +2066,21 @@ function installToolbeltCompatOn(parser) {
         const amount = hpUpdates.reduce((total, update) => total + Math.abs(Number(update.value)), 0);
         if (!Number.isFinite(amount) || amount <= 0) return null;
 
-        const targetDocument = fromUuidSyncSafe(appliedDamage.uuid);
-        const actor = targetDocument?.actor || targetDocument;
         const isHealing = appliedDamage.isHealing === true;
-
-        // Preferred source: the HP values captured in preUpdateActor, which are exact.
-        const recorded = this.peekRecentHpChange(actor);
-        if (recorded && Number.isFinite(Number(recorded.previousHp)) && Number.isFinite(Number(recorded.currentHp))) {
+        // Only the same applyDamage invocation can supply trusted HP values. A nearby
+        // manual edit, undo, or another hit is not evidence for this message's HP transition.
+        if (snapshot?.applicationId && snapshot.actorUuid === appliedDamage.uuid
+            && damageUpdateSignature(snapshot.updates) === damageUpdateSignature(hpUpdates)
+            && Number.isFinite(snapshot.previousHp) && Number.isFinite(snapshot.currentHp)) {
             return {
                 amount,
                 isHealing,
-                previousHp: Number(recorded.previousHp),
-                currentHp: Number(recorded.currentHp),
+                previousHp: snapshot.previousHp,
+                currentHp: snapshot.currentHp,
                 trusted: true
             };
         }
-
-        // Fallback: read the actor now and walk the update deltas back. Only correct while the
-        // actor still holds exactly the value this application produced, which is not guaranteed
-        // on a client that merely received the message, so the result is flagged untrusted.
-        const currentHp = Number(actor?.system?.attributes?.hp?.value);
-        const hpValueUpdate = hpUpdates.find(update => update.path === "system.attributes.hp.value");
-        const hpDelta = Number(hpValueUpdate?.value);
-        const previousHp = Number.isFinite(currentHp) && Number.isFinite(hpDelta) ? currentHp + hpDelta : undefined;
-
-        return {
-            amount,
-            isHealing,
-            previousHp,
-            currentHp: Number.isFinite(currentHp) ? currentHp : undefined,
-            trusted: false
-        };
+        return { amount, isHealing, trusted: false };
     };
 
     parser.augmentPF2eAppliedDamage ??= function(message) {
@@ -1987,7 +2088,7 @@ function installToolbeltCompatOn(parser) {
         const appliedDamage = systemFlags?.appliedDamage;
         if (!appliedDamage || appliedDamage.isReverted) return false;
 
-        const summary = this.getAppliedDamageSummary(appliedDamage);
+        const summary = this.getAppliedDamageSummary(appliedDamage, message.flags?.[MODULE_ID]?.damageApplication);
         if (!summary) return false;
 
         let changed = false;
@@ -2642,6 +2743,12 @@ function installToolbeltCompatOn(parser) {
 
         const didRevert = this.revertHolodeckMessageStats(message);
         if (didRevert && window.combatForensicsInstance?.rendered) window.combatForensicsInstance.render();
+        if (didRevert && this.isYulongPrimaryGM() && this.saveLiveBackup) {
+            void Promise.resolve().then(() => this.saveLiveBackup()).catch(error => {
+                console.warn("Yulong Homebrew | Failed to save reverted Holodeck statistics.", error);
+                ui.notifications.warn("Yulong Homebrew | 撤销后的统计未能保存，请勿刷新并检查连接。");
+            });
+        }
         return didRevert;
     };
 
@@ -2676,16 +2783,13 @@ function installToolbeltCompatOn(parser) {
         }
     };
 
-    // Non-consuming lookup used by the applied-damage summary: the Target Helper bridge still owns
-    // consumption, this only borrows the exact pre/post HP values captured in preUpdateActor.
+    // Diagnostic lookup only; never use temporal proximity as proof of damage identity.
     parser.peekRecentHpChange ??= function(actor) {
         const target = actor?.actor || actor;
         const now = Date.now();
         for (const key of actorHistoryKeys(target)) {
             const queue = this.recentHpChanges.get(key);
             if (!Array.isArray(queue)) continue;
-            // Newest first: PF2e posts the damage-taken card straight after its own update, so the
-            // latest entry is the one this message describes.
             for (let index = queue.length - 1; index >= 0; index--) {
                 const change = queue[index];
                 if (now - change.timestamp <= TOOLBELT_HP_CHANGE_TIMEOUT_MS) return change;
@@ -2705,23 +2809,28 @@ function installToolbeltCompatOn(parser) {
 
     parser.recordRecentHpChange = function(actor, changed, options = {}) {
         if (!actor) return;
+        const scope = damageApplications.get(actor.uuid);
+        if (!scope?.snapshot || scope.hpChange || !Number.isFinite(options.damageTaken)) return;
         const components = [
             this.getRecentHpComponentChange(actor, changed, "system.attributes.hp.value"),
             this.getRecentHpComponentChange(actor, changed, "system.attributes.hp.temp"),
             this.getRecentHpComponentChange(actor, changed, "system.attributes.hp.sp.value")
         ].filter(Boolean);
 
-        const optionDelta = Number(options.damageTaken);
         const componentDelta = components.reduce((total, component) => total + component.delta, 0);
-        const delta = Number.isFinite(optionDelta) && optionDelta !== 0 ? optionDelta : componentDelta;
+        if (damageUpdateSignature(components.map(component => ({ path: component.path, value: component.delta })))
+            !== damageUpdateSignature(scope.snapshot.updates)) return;
+        const delta = componentDelta;
         if (!Number.isFinite(delta) || delta === 0) return;
 
         const hpValue = components.find(component => component.path === "system.attributes.hp.value");
         const previousHp = hpValue?.previous ?? Number(actor.system?.attributes?.hp?.value);
         const currentHp = hpValue?.current ?? previousHp;
 
-        this.pushRecentHpChange(actor, {
+        const change = {
             id: foundry.utils.randomID(),
+            applicationId: scope.applicationId,
+            nativeMessageCreated: scope.nativeMessageCreated === true,
             delta,
             amount: Math.abs(delta),
             isHealing: delta < 0,
@@ -2730,7 +2839,9 @@ function installToolbeltCompatOn(parser) {
             actor,
             components,
             timestamp: Date.now()
-        });
+        };
+        scope.hpChange = change;
+        this.pushRecentHpChange(actor, change);
     };
 
     parser.consumeRecentHpChange = function(targetDoc, fallbackAmount, fallbackHealing, options = {}) {
@@ -2747,7 +2858,11 @@ function installToolbeltCompatOn(parser) {
                 if (fresh.length > 0) this.recentHpChanges.set(key, fresh);
                 else this.recentHpChanges.delete(key);
             }
-            const change = fresh[0];
+            // PF2e's native card is authoritative. Never synthesize it a second time.
+            // Ambiguous histories also fail closed instead of borrowing an unrelated edit.
+            const candidates = fresh.filter(change => change.applicationId && change.completed === true && !change.nativeMessageCreated
+                && (change.isHealing ?? change.delta < 0) === fallbackHealing);
+            const change = candidates.length === 1 ? candidates[0] : null;
             if (!change) continue;
 
             this.removeRecentHpChange(change);

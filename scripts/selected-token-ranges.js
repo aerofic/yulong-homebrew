@@ -1,9 +1,9 @@
 import { collectTokenRanges } from "./range-data.js";
 import { squareRangeOutline } from "./range-geometry.js";
+import { groupRangeFeatures, coloredRangeSegments, gridlessRangeSegments } from "./range-colors.js";
 
 const MODULE_ID = "yulong-homebrew";
 export const SELECTED_TOKEN_RANGES = "selectedTokenRanges";
-const COLORS = { reach: 0x9bc9e3, self: 0xc5afd9, increment: 0xd7c69a, range: 0xd7c69a };
 const chinese = game => /^(cn|zh)(?:-|$)/i.test(game.i18n.lang);
 const labels = game => chinese(game)
     ? { reach: "触及", self: "自身范围", increment: "射程增量", range: "射程", base: "基础触及" }
@@ -57,39 +57,43 @@ export function createSelectedTokenRangeController({ game, canvas, Hooks, PIXI, 
         const unit = Math.max(1, Math.min(2, grid.sizeX / 100));
         let previousLabelY = -Infinity;
         // Largest first: smaller outlines stay legible where boundaries meet.
-        for (const range of [...cache.ranges].reverse()) {
+        for (const range of groupRangeFeatures(cache.ranges, grid.type)) {
             const graphics = new PIXI.Graphics();
             graphics.eventMode = "none";
-            graphics.lineStyle(unit, COLORS[range.kind], 0.25);
-            let position;
+            let position, segments;
             if (grid.type === 1 && typeof token.distanceTo === "function") {
                 const outline = squareRangeOutline({ grid, bounds, distance: range.distance,
-                    measure: point => token.distanceTo(point, { reach: range.kind === "reach" ? range.distance : null }) });
+                    measure: point => token.distanceTo(point, { reach: range.reach }) });
                 if (!outline) { graphics.destroy(); continue; }
-                for (const [a, b] of outline.segments) graphics.moveTo(a.x, a.y).lineTo(b.x, b.y);
+                segments = outline.segments;
                 position = outline.label;
             } else if (grid.type === 0) {
                 // Gridless is a geometric planar reference from the occupied
                 // rectangle's edge, not a claim about grid-square eligibility.
                 const radius = range.distance / grid.distance * grid.sizeX;
-                graphics.drawRoundedRect(bounds.x - radius, bounds.y - radius,
-                    bounds.width + 2 * radius, bounds.height + 2 * radius, radius);
+                segments = gridlessRangeSegments(bounds, radius);
                 position = { x: bounds.x + bounds.width / 2, y: bounds.y - radius };
             } else { graphics.destroy(); continue; }
+            const colors = [...new Set(range.features.map(feature => feature.color))];
+            for (const { a, b, color } of coloredRangeSegments(segments, colors, grid.sizeX / 4)) {
+                graphics.lineStyle(unit, color, 0.25);
+                graphics.moveTo(a.x, a.y).lineTo(b.x, b.y);
+            }
             layer.addChild(graphics);
-            const names = range.names.join(" / ");
-            const compactNames = names.length > 48 ? `${names.slice(0, 45)}…` : names;
-            const text = new PIXI.Text(`${range.distance} ft · ${labels(game)[range.kind]} · ${compactNames}`, {
-                fontFamily: "sans-serif", fontSize: 11 * unit, fill: COLORS[range.kind], stroke: 0x111111,
-                strokeThickness: 2, align: "center"
-            });
-            text.eventMode = "none";
-            text.alpha = 0.55;
-            text.anchor.set(0.5, 1);
-            const y = Math.max(position.y - 3 * unit, previousLabelY + 14 * unit);
-            text.position.set(position.x, y);
-            previousLabelY = y;
-            layer.addChild(text);
+            for (const feature of range.features) {
+                const compactName = feature.name.length > 48 ? `${feature.name.slice(0, 45)}…` : feature.name;
+                const text = new PIXI.Text(`${range.distance} ft · ${labels(game)[feature.kind]} · ${compactName}`, {
+                    fontFamily: "sans-serif", fontSize: 11 * unit, fill: feature.color, stroke: 0x111111,
+                    strokeThickness: 2, align: "center"
+                });
+                text.eventMode = "none";
+                text.alpha = 0.55;
+                text.anchor.set(0.5, 1);
+                const y = Math.max(position.y - 3 * unit, previousLabelY + 14 * unit);
+                text.position.set(position.x, y);
+                previousLabelY = y;
+                layer.addChild(text);
+            }
         }
     }
     function schedule() {

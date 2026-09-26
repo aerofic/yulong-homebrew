@@ -84,13 +84,14 @@ test('change preview uses new x5 and x6 values', () => {
 for (const multiplier of [5, 6]) test(`execute x${multiplier} adds only the extra weakness and records selected multiplier`, async () => {
     const { c } = environment(), applications = [], updates = [];
     const actor = { system: { traits: { value: ['troop'] }, attributes: { weaknesses: [{ type: 'area-damage', value: 10 }] } },
-        async applyDamage(params) { applications.push(params); } };
+        canUserModify: () => true, async applyDamage(params) { applications.push(params); } };
     c.getTroopAreaWeaknessTarget = () => ({ actor, token: { uuid: 'Scene.test.Token.troop' } });
     c.updateTroopAreaWeaknessAdvisorMessage = async (message, updated) => updates.push(updated);
-    await c.executeTroopAreaWeaknessAdvisor({}, { weakness: { value: 10 }, suggestedMultiplier: multiplier }, String(multiplier));
+    await c.executeTroopAreaWeaknessAdvisor({}, { rawDamage: 100, weakness: { value: 10 }, suggestedMultiplier: multiplier }, String(multiplier));
     assert.equal(applications.length, 1);
     assert.equal(applications[0].damage, 10 * (multiplier - 1));
     assert.equal(applications[0].final, true);
     assert.equal(updates[0].selectedMultiplier, multiplier);
-    assert.equal(updates[0].executed, true);
+    assert.equal(updates[0].processing, true);
+    assert.equal(updates.at(-1).executed, true);
 });

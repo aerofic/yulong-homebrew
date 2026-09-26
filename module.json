@@ -2,7 +2,7 @@
   "id": "yulong-homebrew",
   "title": "Yulong Homebrew",
   "description": "PF2e homebrew and compatibility: troop damage and area weakness, statistics and achievement fixes, low-HP incapacitation handling, a hideable Fumble Switch widget, and optional GM-only selected creature range outlines.",
-  "version": "1.2.0",
+  "version": "1.2.2",
   "socket": true,
   "compatibility": {
     "minimum": "14",
